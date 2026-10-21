@@ -1,0 +1,53 @@
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index f4c8137..1dff87e 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -90,7 +90,7 @@ export default function LookupPage() {
+     <>
+       <h1>Look up students by Neo ID</h1>
+       <p className="lede">
+-        Paste Neo IDs, several per line if you like. Each one must be a letter then a digit, four times over, like{" "}
++        Paste Neo IDs or copy a whole table. Only valid Neo IDs are processed; times, dates, headings, and other text are ignored. Each ID must be a letter then a digit, four times over, like{" "}
+         <NeoIdText id="A1B2C3D4" />.
+       </p>
+ 
+diff --git a/src/lib/neo.ts b/src/lib/neo.ts
+index 736770b..11d77d4 100644
+--- a/src/lib/neo.ts
++++ b/src/lib/neo.ts
+@@ -55,7 +55,7 @@ export function tokenize(text: string): string[] {
+   return text
+     .split(/[\s,;|]+/)
+     .map((word) => word.replace(/^["'`()[\]{}<>]+|["'`()[\]{}<>.:]+$/g, ""))
+-    .filter((word) => word.length > 0);
++    .filter((word) => word.length > 0 && isValidNeoId(word));
+ }
+ 
+ export type TokenStatus = "valid" | "invalid" | "duplicate";
+diff --git a/tests/logic.test.ts b/tests/logic.test.ts
+index f94e864..33f65b8 100644
+--- a/tests/logic.test.ts
++++ b/tests/logic.test.ts
+@@ -35,15 +35,16 @@ describe("Neo ID validation", () => {
+     assert.deepEqual(tokenize("  \n\t "), []);
+   });
+ 
+-  it("flags repeats case-insensitively and keeps invalid words invalid", () => {
+-    const c = classifyTokens(["A1B2C3D4", "a1b2c3d4", "BAD", "A1B2C3D4"]);
+-    assert.deepEqual(c.map((t) => t.status), ["valid", "duplicate", "invalid", "duplicate"]);
+-    assert.equal(c[1].id, "A1B2C3D4");
++  it("ignores invalid words and keeps duplicate valid IDs detectable", () => {
++    const c = classifyTokens(tokenize("A1B2C3D4 12:00 PM BAD a1b2c3d4 21st Oct 2026 A1B2C3D4"));
++    assert.deepEqual(c.map((t) => t.status), ["valid", "duplicate", "duplicate"]);
++    assert.deepEqual(c.map((t) => t.id), ["A1B2C3D4", "A1B2C3D4", "A1B2C3D4"]);
+   });
+ 
+-  it("never lets one bad word poison its neighbours", () => {
++  it("discards invalid tokens without affecting valid IDs around them", () => {
+     const c = classifyTokens(tokenize("A1B2C3D4 A1B2C3D K1M3P5R7"));
+-    assert.deepEqual(c.map((t) => t.status), ["valid", "invalid", "valid"]);
++    assert.deepEqual(c.map((t) => t.status), ["valid", "valid"]);
++    assert.deepEqual(c.map((t) => t.id), ["A1B2C3D4", "K1M3P5R7"]);
+   });
+ });
+ 
