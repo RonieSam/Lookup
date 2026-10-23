@@ -1,0 +1,1168 @@
+diff --git a/README.md b/README.md
+index d139353..c6a9079 100644
+--- a/README.md
++++ b/README.md
+@@ -2,8 +2,8 @@
+ 
+ Paste Neo IDs, check each one, and see the matching student records. Admins can upload spreadsheets to add or update student details.
+ 
+-- **Lookup page (`/`)**: paste any text, even a whole schedule or email. Every word is checked on its own, and only words that are valid Neo IDs are looked up; times, dates and other words are dropped (the page just shows how many were ignored). Results show found and not-found IDs, and can be copied or downloaded as CSV.
+-- **Admin page (`/admin`)**: password-protected upload of `.xlsx` or `.csv` files. Columns the database doesn't have yet (Email, say) are created automatically.
++- **Lookup page (`/`)**: paste any text, even a whole schedule or email. Every word is checked on its own, and only words that are valid Neo IDs are looked up; times, dates and other words are dropped (the page just shows how many were ignored). Results show found and not-found IDs, and can be copied or downloaded as CSV. Click any column heading to sort by it, and click again to reverse; the copy and CSV buttons follow the order on screen.
++- **Admin page (`/admin`)**: password-protected upload of `.xlsx` or `.csv` files (columns the database doesn't have yet, like Email, are created automatically), plus placements: which students were placed in which companies.
+ 
+ ## The Neo ID rule
+ 
+@@ -45,6 +45,17 @@ Free plans have usage limits and they change, so check the current limits for Ne
+ - Rows with a missing or invalid Neo ID are skipped and listed with their row number in the file.
+ - Always click **Preview changes** first. It shows exactly what saving will do, and nothing is written until you click **Save to database**. Re-uploading the same file is safe and changes nothing.
+ 
++## Placements
++
++On the admin page, type a company name, paste the Neo IDs of the students placed there, and click **Add to company**. Anything in the paste that isn't a Neo ID is ignored, so a whole email or list is fine.
++
++- **A student can be in any number of companies.** Adding someone to a second company keeps the first. On the lookup page the Companies column lists all of a student's companies, alphabetically, and appears once any placement exists.
++- **Company names match ignoring capital letters and extra spaces.** "tcs", " TCS " and "Tcs" are one company, shown with the spelling used the first time. Typing in the Company box suggests existing names.
++- **Adding twice is harmless.** Students already in the company are counted and skipped.
++- **IDs with no student record yet are still saved.** After saving, the admin page lists them, in case one is a typo. Fix it by clicking **Remove from company** with the wrong ID, then adding the right one.
++- **Undo.** **Remove from company** takes the pasted students out of that company. A company with nobody left disappears. The table of companies has a **Delete** button that removes a company and all its placements.
++- Placements are public on the lookup page like the rest of a student's details.
++
+ ## Who can see what
+ 
+ - **Uploads and the admin page** need the admin password. The password is checked on the server, the session is a signed `HttpOnly` cookie that lasts 8 hours, and five wrong passwords lock an IP out for 15 minutes.
+@@ -74,7 +85,7 @@ NEO_SAMPLE_XLSX=/path/to/students.xlsx npm test
+ 
+ ## How it's built
+ 
+-Next.js (App Router) and TypeScript. Each student is one row: the Neo ID plus a JSON `data` object, so a new column never needs a database migration. Column order and display names live in a small `student_columns` table.
++Next.js (App Router) and TypeScript. Each student is one row: the Neo ID plus a JSON `data` object, so a new column never needs a database migration. Column order and display names live in a small `student_columns` table. Placements are a `companies` table plus a `placements` table with one row per student and company. All tables are created automatically the first time the app runs, including on an existing deployment.
+ 
+ | Path | What it does |
+ | --- | --- |
+@@ -82,6 +93,8 @@ Next.js (App Router) and TypeScript. Each student is one row: the Neo ID plus a
+ | `src/lib/columns.ts` | Header cleanup, column matching, spreadsheet row parsing |
+ | `src/lib/merge.ts` | How an uploaded record merges into a stored one |
+ | `src/lib/students.ts` | Lookup, upload validation, preview and save |
++| `src/lib/placements.ts` | Company names, adding and removing placements |
++| `src/lib/sort.ts` | Column sorting for the results table |
+ | `src/lib/auth.ts` | Password check, session cookie, login throttle |
+ | `src/lib/db.ts` | Database access through Neon's serverless driver (one short-lived connection per operation) |
+ | `src/lib/env.ts` | Reads settings from `process.env` or, on Workers, from Cloudflare bindings |
+diff --git a/src/app/admin/page.tsx b/src/app/admin/page.tsx
+index aa29826..6db8228 100644
+--- a/src/app/admin/page.tsx
++++ b/src/app/admin/page.tsx
+@@ -4,11 +4,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
+ import { NeoIdText } from "@/components/NeoIdText";
+ import { ApiError, api } from "@/lib/client";
+ import { buildMapping, detectNeoColumn, parseRows, type MappedColumn } from "@/lib/columns";
+-import type { UploadStats } from "@/lib/students";
++import { classifyTokens, tokenize } from "@/lib/neo";
++import type { PlacementResult } from "@/lib/placements";
++import type { CompanySummary, UploadStats } from "@/lib/students";
+ 
+ interface Summary {
+   studentCount: number;
+   columns: { key: string; label: string }[];
++  companies: CompanySummary[];
+ }
+ 
+ interface ParsedFile {
+@@ -137,6 +140,10 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () =>
+             <b>{summary.columns.length}</b>
+             <span>detail columns</span>
+           </div>
++          <div className="stat">
++            <b>{summary.companies.length}</b>
++            <span>{summary.companies.length === 1 ? "company" : "companies"}</span>
++          </div>
+         </div>
+         {summary.columns.length > 0 ? (
+           <div className="cols">
+@@ -152,12 +159,208 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () =>
+       </section>
+ 
+       <Uploader summary={summary} onChanged={onChanged} />
++      <Placements summary={summary} onChanged={onChanged} />
+     </div>
+   );
+ }
+ 
+ /* ------------------------------------------------------------------ */
+ 
++function describePlacement(r: PlacementResult): string {
++  const students = (n: number) => `${fmt(n)} ${n === 1 ? "student" : "students"}`;
++  const parts: string[] = [];
++  if (r.action === "add") {
++    parts.push(`Added ${students(r.added)} to ${r.company}.`);
++    if (r.alreadyIn > 0) parts.push(`${fmt(r.alreadyIn)} ${r.alreadyIn === 1 ? "was" : "were"} already in it.`);
++  } else if (r.action === "remove") {
++    parts.push(`Removed ${students(r.removed)} from ${r.company}.`);
++    if (r.notIn > 0) parts.push(`${fmt(r.notIn)} ${r.notIn === 1 ? "wasn't" : "weren't"} in it.`);
++    if (r.companyGone) parts.push("That was the last student, so the company was removed.");
++  } else {
++    parts.push(`Deleted ${r.company} and its ${students(r.removed)}.`);
++  }
++  if (r.ignored > 0) parts.push(`${fmt(r.ignored)} other ${r.ignored === 1 ? "word" : "words"} ignored.`);
++  return parts.join(" ");
++}
++
++function Placements({ summary, onChanged }: { summary: Summary; onChanged: () => Promise<void> }) {
++  const [company, setCompany] = useState("");
++  const [text, setText] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [done, setDone] = useState<PlacementResult | null>(null);
++
++  const counts = useMemo(() => {
++    const all = classifyTokens(tokenize(text));
++    return {
++      ids: all.filter((t) => t.status === "valid").length,
++      repeats: all.filter((t) => t.status === "duplicate").length,
++      ignored: all.filter((t) => t.status === "invalid").length,
++    };
++  }, [text]);
++
++  async function run(action: "add" | "remove" | "delete_company", name: string) {
++    setBusy(true);
++    setError(null);
++    setDone(null);
++    try {
++      const result = await api<PlacementResult>("/api/admin/placements", { json: { action, company: name, text } });
++      setDone(result);
++      if (action !== "delete_company") {
++        setCompany("");
++        setText("");
++      }
++      await onChanged();
++    } catch (err) {
++      if (err instanceof ApiError && err.status === 401) {
++        await onChanged(); // session expired: back to the sign-in form
++        return;
++      }
++      setError(err instanceof Error ? err.message : "That didn't work.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const ready = company.trim() !== "" && counts.ids > 0 && !busy;
++
++  return (
++    <section className="card" aria-labelledby="pl-title">
++      <h2 id="pl-title">Placements</h2>
++      <p className="lede">
++        Choose a company and paste the Neo IDs of the students placed in it. A student can be in as many companies as
++        you like. Company names match ignoring capital letters, so "tcs" and "TCS" are one company.
++      </p>
++
++      <div className="stack">
++        <div>
++          <label htmlFor="company">Company</label>
++          <input
++            id="company"
++            type="text"
++            list="company-names"
++            autoComplete="off"
++            maxLength={100}
++            value={company}
++            disabled={busy}
++            onChange={(e) => setCompany(e.target.value)}
++          />
++          <datalist id="company-names">
++            {summary.companies.map((c) => (
++              <option key={c.name} value={c.name} />
++            ))}
++          </datalist>
++        </div>
++
++        <div>
++          <label htmlFor="placed-ids">Neo IDs</label>
++          <textarea
++            id="placed-ids"
++            value={text}
++            disabled={busy}
++            spellCheck={false}
++            autoCapitalize="characters"
++            autoComplete="off"
++            placeholder={"A1B2C3D4 K1M3P5R7\nT2V4X6Z8"}
++            style={{ minHeight: 120 }}
++            onChange={(e) => setText(e.target.value)}
++          />
++          <p className="hint">
++            {counts.ids === 0 && counts.ignored === 0 ? (
++              <>Anything that isn't a Neo ID is ignored, so you can paste a whole list or email.</>
++            ) : (
++              <>
++                <b>{fmt(counts.ids)}</b> Neo {counts.ids === 1 ? "ID" : "IDs"}
++                {counts.repeats > 0 && <> · {fmt(counts.repeats)} repeated</>}
++                {counts.ignored > 0 && (
++                  <>
++                    {" "}
++                    · {fmt(counts.ignored)} other {counts.ignored === 1 ? "word" : "words"} ignored
++                  </>
++                )}
++              </>
++            )}
++          </p>
++        </div>
++
++        <div className="row">
++          <button className="btn primary" onClick={() => run("add", company)} disabled={!ready}>
++            {busy ? "Saving…" : "Add to company"}
++          </button>
++          <button className="btn" onClick={() => run("remove", company)} disabled={!ready}>
++            Remove from company
++          </button>
++        </div>
++
++        {error && (
++          <div className="notice bad" role="alert">
++            {error}
++          </div>
++        )}
++        {done && (
++          <div className="notice ok" role="status">
++            {describePlacement(done)}
++          </div>
++        )}
++        {done && done.action === "add" && done.unknownStudents.count > 0 && (
++          <div className="notice warn" role="status">
++            {fmt(done.unknownStudents.count)} {done.unknownStudents.count === 1 ? "Neo ID has" : "Neo IDs have"} no student
++            record yet, so only the company is saved for them. If that's a typo, remove{" "}
++            {done.unknownStudents.count === 1 ? "it" : "them"} from the company and add the right ID:{" "}
++            {done.unknownStudents.sample.slice(0, 10).map((id, i) => (
++              <span key={id}>
++                {i > 0 && ", "}
++                <NeoIdText id={id} />
++              </span>
++            ))}
++            {done.unknownStudents.count > 10 && <> and {fmt(done.unknownStudents.count - 10)} more</>}
++          </div>
++        )}
++      </div>
++
++      {summary.companies.length > 0 && (
++        <div className="table-wrap">
++          <table>
++            <thead>
++              <tr>
++                <th scope="col">Company</th>
++                <th scope="col">Students</th>
++                <th scope="col">
++                  <span className="sr-only">Actions</span>
++                </th>
++              </tr>
++            </thead>
++            <tbody>
++              {summary.companies.map((c) => (
++                <tr key={c.name}>
++                  <td>{c.name}</td>
++                  <td className="num">{fmt(c.count)}</td>
++                  <td style={{ textAlign: "right" }}>
++                    <button
++                      className="btn quiet"
++                      disabled={busy}
++                      aria-label={`Delete ${c.name}`}
++                      onClick={() => {
++                        if (window.confirm(`Delete ${c.name} and remove all ${fmt(c.count)} of its placements? This can't be undone.`)) {
++                          run("delete_company", c.name);
++                        }
++                      }}
++                    >
++                      Delete
++                    </button>
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      )}
++    </section>
++  );
++}
++
++/* ------------------------------------------------------------------ */
++
+ function Uploader({ summary, onChanged }: { summary: Summary; onChanged: () => Promise<void> }) {
+   const [file, setFile] = useState<ParsedFile | null>(null);
+   const [parseError, setParseError] = useState<string | null>(null);
+diff --git a/src/app/api/admin/placements/route.ts b/src/app/api/admin/placements/route.ts
+new file mode 100644
+index 0000000..1c21c26
+--- /dev/null
++++ b/src/app/api/admin/placements/route.ts
+@@ -0,0 +1,18 @@
++import { getReadyDb } from "@/lib/db";
++import { handle, json, readJson, requireAdmin } from "@/lib/http";
++import { PLACEMENT_ACTIONS, changePlacements, type PlacementAction } from "@/lib/placements";
++import { HttpError } from "@/lib/students";
++
++const MAX_TEXT = 200_000;
++
++export const POST = handle(async (request) => {
++  await requireAdmin(request);
++  const body = (await readJson(request)) as { action?: unknown; company?: unknown; text?: unknown };
++
++  const action = body?.action as PlacementAction;
++  if (!PLACEMENT_ACTIONS.includes(action)) throw new HttpError(400, "Unknown action.");
++  if (typeof body.text === "string" && body.text.length > MAX_TEXT) {
++    throw new HttpError(413, "That's too much text at once.");
++  }
++  return json(await changePlacements(await getReadyDb(), { action, company: body.company, text: body.text }));
++});
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 0196619..4adb8df 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -73,7 +73,7 @@ nav a:hover { color: var(--ink); text-decoration: underline; }
+ 
+ /* ---------- form controls ---------- */
+ label { font-weight: 600; display: block; margin-bottom: 6px; }
+-textarea, input[type="password"], select {
++textarea, input[type="password"], input[type="text"], select {
+   width: 100%;
+   font: inherit;
+   color: var(--ink);
+@@ -150,6 +150,19 @@ th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--lin
+ th { position: sticky; top: 0; background: var(--sunken); font-weight: 600; white-space: nowrap; z-index: 1; }
+ tr:last-child td { border-bottom: 0; }
+ td.num { font-variant-numeric: tabular-nums; }
++th[aria-sort] { padding: 0; }
++.sort {
++  all: unset; box-sizing: border-box; cursor: pointer; width: 100%;
++  display: flex; align-items: center; justify-content: space-between; gap: 8px;
++  padding: 8px 12px; font-weight: 600; color: var(--ink); white-space: nowrap;
++}
++.sort:hover { background: var(--accent-soft); }
++.sort:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; }
++.sort-mark { color: var(--muted); font-size: 0.75rem; }
++th[aria-sort="ascending"] .sort-mark, th[aria-sort="descending"] .sort-mark { color: var(--accent); }
++.companies { display: flex; flex-wrap: wrap; gap: 4px; }
++.none { color: var(--muted); }
++.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+ td.note { color: var(--muted); }
+ .badge {
+   display: inline-block; font-size: 0.82rem; font-weight: 600; line-height: 1.5;
+@@ -189,6 +202,7 @@ progress { width: 100%; height: 10px; accent-color: var(--accent); }
+ @media (max-width: 560px) {
+   .card { padding: 14px; }
+   th, td { padding: 7px 8px; }
++  .sort { padding: 7px 8px; }
+ }
+ @media (prefers-reduced-motion: no-preference) {
+   .btn, .filter { transition: border-color 0.12s, background-color 0.12s; }
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index 6cd20b2..a363215 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -4,7 +4,8 @@ import { useMemo, useRef, useState } from "react";
+ import { NeoIdText } from "@/components/NeoIdText";
+ import { api, downloadText, formatCell, toCsv, toTsv } from "@/lib/client";
+ import { classifyTokens, tokenize } from "@/lib/neo";
+-import type { LookupResult, LookupStatus } from "@/lib/students";
++import { nextSort, sortRows, type SortState, type SortValue } from "@/lib/sort";
++import type { LookupResult, LookupRow, LookupStatus } from "@/lib/students";
+ 
+ const MAX_CHIPS = 300;
+ 
+@@ -15,6 +16,43 @@ const STATUS_LABEL: Record<LookupStatus, string> = {
+ 
+ type Filter = "all" | LookupStatus;
+ 
++// Built-in columns use keys that an uploaded column can never have (those start with a letter or digit).
++const SORT_NEO = "@neo";
++const SORT_STATUS = "@status";
++const SORT_COMPANIES = "@companies";
++
++function sortValue(r: LookupRow, key: string): SortValue {
++  if (key === SORT_NEO) return r.neoId;
++  if (key === SORT_STATUS) return STATUS_LABEL[r.status];
++  if (key === SORT_COMPANIES) return r.companies.join(", ");
++  const v = r.data?.[key];
++  return typeof v === "boolean" ? formatCell(v) : v;
++}
++
++function SortHeader({
++  label,
++  sortKey,
++  sort,
++  onSort,
++}: {
++  label: string;
++  sortKey: string;
++  sort: SortState | null;
++  onSort: (key: string) => void;
++}) {
++  const active = sort?.key === sortKey;
++  return (
++    <th scope="col" aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
++      <button type="button" className="sort" onClick={() => onSort(sortKey)}>
++        {label}
++        <span className="sort-mark" aria-hidden="true">
++          {active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}
++        </span>
++      </button>
++    </th>
++  );
++}
++
+ export default function LookupPage() {
+   const [text, setText] = useState("");
+   const [loading, setLoading] = useState(false);
+@@ -22,6 +60,7 @@ export default function LookupPage() {
+   const [error, setError] = useState<string | null>(null);
+   const [filter, setFilter] = useState<Filter>("all");
+   const [copied, setCopied] = useState(false);
++  const [sort, setSort] = useState<SortState | null>(null);
+   const resultsRef = useRef<HTMLDivElement>(null);
+ 
+   // Words that aren't Neo IDs (times, dates, labels...) are dropped; they're only counted.
+@@ -43,6 +82,7 @@ export default function LookupPage() {
+       const data = await api<LookupResult>("/api/lookup", { json: { text } });
+       setResult(data);
+       setFilter("all");
++      setSort(null);
+       requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+     } catch (err) {
+       setError(err instanceof Error ? err.message : "The lookup failed.");
+@@ -54,18 +94,27 @@ export default function LookupPage() {
+   function clearAll() {
+     setText("");
+     setResult(null);
++    setSort(null);
+     setError(null);
+   }
+ 
+-  const visibleRows = result ? result.rows.filter((r) => filter === "all" || r.status === filter) : [];
++  const showCompanies = result?.hasPlacements === true;
++
++  // The rows on screen: filtered, then sorted. Copy and CSV export use this same order.
++  const visibleRows = useMemo(() => {
++    if (!result) return [];
++    const filtered = result.rows.filter((r) => filter === "all" || r.status === filter);
++    return sort ? sortRows(filtered, (r) => sortValue(r, sort.key), sort.dir) : filtered;
++  }, [result, filter, sort]);
+ 
+   function exportRows(): unknown[][] {
+     if (!result) return [];
+-    const head = ["Neo ID", "Status", ...result.columns.map((c) => c.label)];
++    const head = ["Neo ID", "Status", ...result.columns.map((c) => c.label), ...(showCompanies ? ["Companies"] : [])];
+     const body = visibleRows.map((r) => [
+       r.neoId,
+       STATUS_LABEL[r.status],
+       ...result.columns.map((c) => (r.data ? formatCell(r.data[c.key]) : "")),
++      ...(showCompanies ? [r.companies.join("; ")] : []),
+     ]);
+     return [head, ...body];
+   }
+@@ -183,7 +232,8 @@ export default function LookupPage() {
+               <p className="empty">No Neo IDs in the pasted text.</p>
+             ) : (
+               <>
+-                <div className="filters" role="group" aria-label="Filter results" style={{ marginTop: 12 }}>
++                <div className="row" style={{ marginTop: 12 }}>
++                <div className="filters" role="group" aria-label="Filter results">
+                   {(
+                     [
+                       ["all", "All", result.summary.unique],
+@@ -196,6 +246,12 @@ export default function LookupPage() {
+                     </button>
+                   ))}
+                 </div>
++                {sort && (
++                  <button className="btn quiet" onClick={() => setSort(null)}>
++                    Original order
++                  </button>
++                )}
++                </div>
+                 {result.summary.repeats > 0 && (
+                   <p className="hint">
+                     {result.summary.repeats} repeated {result.summary.repeats === 1 ? "ID was" : "IDs were"} merged into
+@@ -207,14 +263,15 @@ export default function LookupPage() {
+                   <table>
+                     <thead>
+                       <tr>
+-                        <th scope="col">Neo ID</th>
+-                        <th scope="col">Status</th>
++                        <SortHeader label="Neo ID" sortKey={SORT_NEO} sort={sort} onSort={(k) => setSort((cur) => nextSort(cur, k))} />
++                        <SortHeader label="Status" sortKey={SORT_STATUS} sort={sort} onSort={(k) => setSort((cur) => nextSort(cur, k))} />
+                         {result.columns.map((c) => (
+-                          <th key={c.key} scope="col">
+-                            {c.label}
+-                          </th>
++                          <SortHeader key={c.key} label={c.label} sortKey={c.key} sort={sort} onSort={(k) => setSort((cur) => nextSort(cur, k))} />
+                         ))}
+                         {result.columns.length === 0 && <th scope="col">Details</th>}
++                        {showCompanies && (
++                          <SortHeader label="Companies" sortKey={SORT_COMPANIES} sort={sort} onSort={(k) => setSort((cur) => nextSort(cur, k))} />
++                        )}
+                       </tr>
+                     </thead>
+                     <tbody>
+@@ -242,11 +299,26 @@ export default function LookupPage() {
+                               No student has this Neo ID.
+                             </td>
+                           )}
++                          {showCompanies && (
++                            <td>
++                              {r.companies.length > 0 ? (
++                                <span className="companies">
++                                  {r.companies.map((name) => (
++                                    <span key={name} className="badge info">
++                                      {name}
++                                    </span>
++                                  ))}
++                                </span>
++                              ) : (
++                                <span className="none">—</span>
++                              )}
++                            </td>
++                          )}
+                         </tr>
+                       ))}
+                       {visibleRows.length === 0 && (
+                         <tr>
+-                          <td className="note" colSpan={2 + Math.max(result.columns.length, 1)}>
++                          <td className="note" colSpan={2 + Math.max(result.columns.length, 1) + (showCompanies ? 1 : 0)}>
+                             Nothing in this view.
+                           </td>
+                         </tr>
+diff --git a/src/lib/db.ts b/src/lib/db.ts
+index 652782a..f85025c 100644
+--- a/src/lib/db.ts
++++ b/src/lib/db.ts
+@@ -112,6 +112,22 @@ async function ensureSchema(db: Db): Promise<void> {
+         label    text not null,
+         position integer not null
+       )`);
++    await tx.query(`
++      create table if not exists companies (
++        key        text primary key,
++        name       text not null,
++        created_at timestamptz not null default now()
++      )`);
++    // One row per (student, company), so a student can be placed in several companies.
++    // No foreign key to students: a placement can be recorded before the student is uploaded.
++    await tx.query(`
++      create table if not exists placements (
++        neo_id      text not null check (neo_id ~ '^([A-Z][0-9]){4}$'),
++        company_key text not null references companies (key) on delete cascade,
++        created_at  timestamptz not null default now(),
++        primary key (neo_id, company_key)
++      )`);
++    await tx.query("create index if not exists placements_company_idx on placements (company_key)");
+     await tx.query(`
+       create table if not exists login_throttle (
+         ip           text primary key,
+diff --git a/src/lib/placements.ts b/src/lib/placements.ts
+new file mode 100644
+index 0000000..03adcc7
+--- /dev/null
++++ b/src/lib/placements.ts
+@@ -0,0 +1,159 @@
++import type { Db } from "./db";
++import { classifyTokens, tokenize } from "./neo";
++import { HttpError, MAX_LOOKUP_TOKENS } from "./students";
++
++/**
++ * Placements: which students have been placed in which companies.
++ *
++ * A student can be in any number of companies, and a company has any number of
++ * students. Company names are matched ignoring case and extra spaces, so
++ * "tcs", "TCS" and " Tcs " are one company, shown with the spelling it was
++ * first entered with.
++ */
++
++export const MAX_COMPANY_LENGTH = 100;
++const SAMPLE_SIZE = 50;
++
++export type PlacementAction = "add" | "remove" | "delete_company";
++export const PLACEMENT_ACTIONS: readonly PlacementAction[] = ["add", "remove", "delete_company"];
++
++export function cleanCompanyName(input: unknown): { name: string; key: string } {
++  if (typeof input !== "string") throw new HttpError(400, "Enter a company name.");
++  const name = input
++    .replace(/[\u0000-\u001f\u007f]/g, " ")
++    .replace(/\s+/g, " ")
++    .trim();
++  if (name === "") throw new HttpError(400, "Enter a company name.");
++  if (name.length > MAX_COMPANY_LENGTH) {
++    throw new HttpError(400, `Company names can be at most ${MAX_COMPANY_LENGTH} characters.`);
++  }
++  return { name, key: name.normalize("NFKC").toLowerCase() };
++}
++
++export interface PlacementResult {
++  action: PlacementAction;
++  /** The company's stored name (which may differ in case from what was typed). */
++  company: string;
++  /** Distinct Neo IDs found in the pasted text. */
++  ids: number;
++  /** Words in the pasted text that aren't Neo IDs. */
++  ignored: number;
++  /** add: students newly placed in the company. */
++  added: number;
++  /** add: students who were already in the company. */
++  alreadyIn: number;
++  /** remove or delete_company: students taken out of the company. */
++  removed: number;
++  /** remove: IDs that weren't in the company to begin with. */
++  notIn: number;
++  /** add: IDs with no student record yet. They are still saved. */
++  unknownStudents: { count: number; sample: string[] };
++  /** True when the company no longer exists (it was deleted, or its last student was removed). */
++  companyGone: boolean;
++}
++
++function parseIds(text: unknown) {
++  if (typeof text !== "string") throw new HttpError(400, "Paste the Neo IDs first.");
++  const classified = classifyTokens(tokenize(text));
++  if (classified.length > MAX_LOOKUP_TOKENS) {
++    throw new HttpError(413, `Too many words. Paste at most ${MAX_LOOKUP_TOKENS} at a time.`);
++  }
++  const ids = classified.filter((t) => t.status === "valid").map((t) => t.id);
++  const ignored = classified.filter((t) => t.status === "invalid").length;
++  if (ids.length === 0) throw new HttpError(400, "No Neo IDs found in that text.");
++  return { ids, ignored };
++}
++
++export async function changePlacements(
++  db: Db,
++  input: { action: PlacementAction; company: unknown; text?: unknown },
++): Promise<PlacementResult> {
++  const { name: typed, key } = cleanCompanyName(input.company);
++  const empty: PlacementResult = {
++    action: input.action,
++    company: typed,
++    ids: 0,
++    ignored: 0,
++    added: 0,
++    alreadyIn: 0,
++    removed: 0,
++    notIn: 0,
++    unknownStudents: { count: 0, sample: [] },
++    companyGone: false,
++  };
++
++  if (input.action === "delete_company") {
++    return db.transaction(async (tx) => {
++      const { rows } = await tx.query<{ name: string }>("select name from companies where key = $1 for update", [key]);
++      if (!rows[0]) throw new HttpError(404, `There's no company called ${typed}.`);
++      const { rows: n } = await tx.query<{ n: number }>(
++        "select count(*)::int as n from placements where company_key = $1",
++        [key],
++      );
++      await tx.query("delete from companies where key = $1", [key]); // placements go with it
++      return { ...empty, company: rows[0].name, removed: n[0]?.n ?? 0, companyGone: true };
++    });
++  }
++
++  const { ids, ignored } = parseIds(input.text);
++  const idsJson = JSON.stringify(ids);
++
++  if (input.action === "add") {
++    return db.transaction(async (tx) => {
++      await tx.query("insert into companies (key, name) values ($1, $2) on conflict (key) do nothing", [key, typed]);
++      const { rows: c } = await tx.query<{ name: string }>("select name from companies where key = $1", [key]);
++
++      const { rows: inserted } = await tx.query<{ neo_id: string }>(
++        `insert into placements (neo_id, company_key)
++         select t.x, $2 from jsonb_array_elements_text($1::jsonb) as t(x)
++         on conflict do nothing
++         returning neo_id`,
++        [idsJson, key],
++      );
++      const { rows: unknown } = await tx.query<{ neo_id: string }>(
++        `select t.x as neo_id from jsonb_array_elements_text($1::jsonb) as t(x)
++         where not exists (select 1 from students s where s.neo_id = t.x)
++         order by t.x`,
++        [idsJson],
++      );
++      return {
++        ...empty,
++        company: c[0]?.name ?? typed,
++        ids: ids.length,
++        ignored,
++        added: inserted.length,
++        alreadyIn: ids.length - inserted.length,
++        unknownStudents: { count: unknown.length, sample: unknown.slice(0, SAMPLE_SIZE).map((u) => u.neo_id) },
++      };
++    });
++  }
++
++  // remove
++  return db.transaction(async (tx) => {
++    const { rows: c } = await tx.query<{ name: string }>("select name from companies where key = $1 for update", [key]);
++    if (!c[0]) throw new HttpError(404, `There's no company called ${typed}.`);
++
++    const { rows: deleted } = await tx.query<{ neo_id: string }>(
++      `delete from placements
++       where company_key = $2 and neo_id in (select jsonb_array_elements_text($1::jsonb))
++       returning neo_id`,
++      [idsJson, key],
++    );
++    // A company with nobody left in it disappears, so the list never shows empty companies.
++    const { rows: gone } = await tx.query<{ key: string }>(
++      `delete from companies c
++       where c.key = $1 and not exists (select 1 from placements p where p.company_key = c.key)
++       returning c.key`,
++      [key],
++    );
++    return {
++      ...empty,
++      company: c[0].name,
++      ids: ids.length,
++      ignored,
++      removed: deleted.length,
++      notIn: ids.length - deleted.length,
++      companyGone: gone.length > 0,
++    };
++  });
++}
+diff --git a/src/lib/sort.ts b/src/lib/sort.ts
+new file mode 100644
+index 0000000..d015743
+--- /dev/null
++++ b/src/lib/sort.ts
+@@ -0,0 +1,42 @@
++/**
++ * Column sorting for the results table.
++ *
++ * - Numbers sort as numbers; text sorts "naturally" and ignoring case, so
++ *   "99XYZ7271" comes before "99XYZ10034".
++ * - Empty cells always sit at the bottom, whichever direction is chosen.
++ * - Ties keep the order the rows were in before sorting.
++ */
++
++export type SortDir = "asc" | "desc";
++export interface SortState {
++  key: string;
++  dir: SortDir;
++}
++export type SortValue = string | number | null | undefined;
++
++const collator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
++
++const isBlank = (v: SortValue) => v === null || v === undefined || v === "";
++
++export function compareValues(a: Exclude<SortValue, null | undefined>, b: Exclude<SortValue, null | undefined>): number {
++  if (typeof a === "number" && typeof b === "number") return a - b;
++  return collator.compare(String(a), String(b));
++}
++
++export function sortRows<T>(rows: readonly T[], value: (row: T) => SortValue, dir: SortDir): T[] {
++  const keyed = rows.map((row, index) => ({ row, index, v: value(row) }));
++  keyed.sort((x, y) => {
++    const xBlank = isBlank(x.v);
++    const yBlank = isBlank(y.v);
++    if (xBlank || yBlank) return xBlank === yBlank ? x.index - y.index : xBlank ? 1 : -1;
++    const c = compareValues(x.v as string | number, y.v as string | number);
++    return c !== 0 ? (dir === "asc" ? c : -c) : x.index - y.index;
++  });
++  return keyed.map((k) => k.row);
++}
++
++/** Clicking a header: a new column sorts ascending, the same column flips direction. */
++export function nextSort(current: SortState | null, key: string): SortState {
++  if (current?.key === key) return { key, dir: current.dir === "asc" ? "desc" : "asc" };
++  return { key, dir: "asc" };
++}
+diff --git a/src/lib/students.ts b/src/lib/students.ts
+index 7d2fb2f..046ffbf 100644
+--- a/src/lib/students.ts
++++ b/src/lib/students.ts
+@@ -28,11 +28,15 @@ export interface LookupRow {
+   /** How many times this ID appeared in the pasted text. */
+   count: number;
+   data?: RecordData;
++  /** Companies this student has been placed in, alphabetical. Empty if none. */
++  companies: string[];
+ }
+ 
+ export interface LookupResult {
+   columns: ColumnDef[];
+   rows: LookupRow[];
++  /** True once any placement has been recorded, so the page can show a Companies column. */
++  hasPlacements: boolean;
+   summary: {
+     words: number;
+     unique: number;
+@@ -72,39 +76,61 @@ export async function lookupStudents(db: Db, text: string): Promise<LookupResult
+       neoId: t.id,
+       status: "not_found",
+       count: 1,
++      companies: [],
+     };
+     rows.push(row);
+     byKey.set(t.id, row);
+   }
+ 
+   const ids = [...byKey.keys()];
++  let columns: ColumnDef[] = [];
++  let hasPlacements = false;
++
+   if (ids.length > 0) {
+-    const { rows: found } = await db.query<{ neo_id: string; data: RecordData }>(
+-      `select neo_id, data from students
+-       where neo_id in (select jsonb_array_elements_text($1::jsonb))`,
+-      [JSON.stringify(ids)],
+-    );
+-    for (const f of found) {
+-      const row = byKey.get(f.neo_id);
+-      if (row) {
+-        row.status = "found";
+-        row.data = f.data;
++    // One transaction, so the three reads share a single database connection.
++    await db.transaction(async (tx) => {
++      const { rows: found } = await tx.query<{ neo_id: string; data: RecordData }>(
++        `select neo_id, data from students
++         where neo_id in (select jsonb_array_elements_text($1::jsonb))`,
++        [JSON.stringify(ids)],
++      );
++      for (const f of found) {
++        const row = byKey.get(f.neo_id);
++        if (row) {
++          row.status = "found";
++          row.data = f.data;
++        }
+       }
+-    }
+-  }
+ 
+-  // Only show columns that have a value for at least one student in this result.
+-  const { rows: allColumns } = await db.query<ColumnDef>(
+-    "select key, label from student_columns order by position",
+-  );
+-  const used = new Set<string>();
+-  for (const r of rows) if (r.data) for (const k of Object.keys(r.data)) used.add(k);
+-  const columns = allColumns.filter((c) => used.has(c.key));
++      const { rows: placed } = await tx.query<{ neo_id: string; name: string }>(
++        `select p.neo_id, c.name
++         from placements p join companies c on c.key = p.company_key
++         where p.neo_id in (select jsonb_array_elements_text($1::jsonb))
++         order by lower(c.name), c.name`,
++        [JSON.stringify(ids)],
++      );
++      for (const p of placed) byKey.get(p.neo_id)?.companies.push(p.name);
++
++      const { rows: exists } = await tx.query<{ placed: boolean }>(
++        "select exists (select 1 from placements) as placed",
++      );
++      hasPlacements = exists[0]?.placed === true;
++
++      // Only show columns that have a value for at least one student in this result.
++      const { rows: allColumns } = await tx.query<ColumnDef>(
++        "select key, label from student_columns order by position",
++      );
++      const used = new Set<string>();
++      for (const r of rows) if (r.data) for (const k of Object.keys(r.data)) used.add(k);
++      columns = allColumns.filter((c) => used.has(c.key));
++    });
++  }
+ 
+   const count = (s: LookupStatus) => rows.filter((r) => r.status === s).length;
+   return {
+     columns,
+     rows,
++    hasPlacements,
+     summary: {
+       words: classified.length,
+       unique: rows.length,
+@@ -303,10 +329,23 @@ export async function applyUpload(db: Db, input: UploadInput): Promise<UploadSta
+ /* Admin summary                                                       */
+ /* ------------------------------------------------------------------ */
+ 
++export interface CompanySummary {
++  name: string;
++  /** How many students are placed in this company. */
++  count: number;
++}
++
+ export async function adminSummary(db: Db) {
+-  // Sequential on purpose: each request then needs only one database connection,
+-  // which matters on free plans with tight connection limits.
+-  const { rows: count } = await db.query<{ n: string }>("select count(*)::text as n from students");
+-  const { rows: columns } = await db.query<ColumnDef>("select key, label from student_columns order by position");
+-  return { studentCount: Number(count[0]?.n ?? 0), columns };
++  // One transaction, so the reads share a single database connection.
++  return db.transaction(async (tx) => {
++    const { rows: count } = await tx.query<{ n: string }>("select count(*)::text as n from students");
++    const { rows: columns } = await tx.query<ColumnDef>("select key, label from student_columns order by position");
++    const { rows: companies } = await tx.query<CompanySummary>(
++      `select c.name, count(p.neo_id)::int as count
++       from companies c left join placements p on p.company_key = c.key
++       group by c.key, c.name
++       order by lower(c.name), c.name`,
++    );
++    return { studentCount: Number(count[0]?.n ?? 0), columns, companies };
++  });
+ }
+diff --git a/tests/auth.test.ts b/tests/auth.test.ts
+index 440f3bf..850fee3 100644
+--- a/tests/auth.test.ts
++++ b/tests/auth.test.ts
+@@ -37,6 +37,7 @@ describe("Admin routes", () => {
+   let upload: typeof import("../src/app/api/admin/upload/route");
+   let status: typeof import("../src/app/api/admin/status/route");
+   let lookup: typeof import("../src/app/api/lookup/route");
++  let placements: typeof import("../src/app/api/admin/placements/route");
+ 
+   before(async () => {
+     await freshDb();
+@@ -44,6 +45,7 @@ describe("Admin routes", () => {
+     upload = await import("../src/app/api/admin/upload/route");
+     status = await import("../src/app/api/admin/status/route");
+     lookup = await import("../src/app/api/lookup/route");
++    placements = await import("../src/app/api/admin/placements/route");
+   });
+ 
+   const payload = { rows: [{ neoId: "A1B2C3D4", values: { full_name: "Asha" } }], columns: [{ key: "full_name", label: "Name" }], overwrite: false, dryRun: false };
+@@ -84,6 +86,29 @@ describe("Admin routes", () => {
+     assert.equal(body.rows.length, 1);
+   });
+ 
++  it("placements are admin-only, and work for a signed-in admin", async () => {
++    const body = { action: "add", company: "Google", text: "A1B2C3D4" };
++    assert.equal((await placements.POST(jsonReq("/api/admin/placements", body))).status, 401);
++    assert.equal((await placements.POST(jsonReq("/api/admin/placements", body, `${SESSION_COOKIE}=1.deadbeef`))).status, 401);
++
++    const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }, undefined, "5.5.5.5"))).headers.get("set-cookie")!.split(";")[0];
++    const ok = await placements.POST(jsonReq("/api/admin/placements", body, cookie));
++    assert.equal(ok.status, 200);
++    assert.equal((await ok.json()).added, 1);
++
++    // visible to everyone on the public lookup
++    const l = await (await lookup.POST(jsonReq("/api/lookup", { text: "A1B2C3D4" }))).json();
++    assert.deepEqual(l.rows[0].companies, ["Google"]);
++    assert.equal(l.hasPlacements, true);
++
++    assert.equal((await placements.POST(jsonReq("/api/admin/placements", { ...body, action: "explode" }, cookie))).status, 400);
++    assert.equal((await placements.POST(jsonReq("/api/admin/placements", { ...body, company: "  " }, cookie))).status, 400);
++    assert.equal((await placements.POST(jsonReq("/api/admin/placements", { action: "remove", company: "Nope", text: "A1B2C3D4" }, cookie))).status, 404);
++
++    const st = await status.GET(new Request("http://localhost/api/admin/status", { headers: { cookie } }));
++    assert.deepEqual((await st.json()).companies, [{ name: "Google", count: 1 }]);
++  });
++
+   it("refuses non-JSON bodies and malformed upload bodies", async () => {
+     const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }))).headers.get("set-cookie")!.split(";")[0];
+     const form = new Request("http://localhost/api/admin/upload", { method: "POST", headers: { cookie, "content-type": "text/plain" }, body: "x" });
+diff --git a/tests/integration.test.ts b/tests/integration.test.ts
+index 68af577..c869f96 100644
+--- a/tests/integration.test.ts
++++ b/tests/integration.test.ts
+@@ -30,7 +30,7 @@ describe("Upload and lookup", () => {
+     ], base);
+     assert.equal(stats.newStudents, 2);
+     assert.deepEqual(stats.newColumns, ["full_name", "cgpa"]);
+-    assert.deepEqual(await adminSummary(db), { studentCount: 2, columns: base });
++    assert.deepEqual(await adminSummary(db), { studentCount: 2, columns: base, companies: [] });
+   });
+ 
+   it("dry run reports the same numbers and writes nothing", async () => {
+@@ -70,6 +70,8 @@ describe("Upload and lookup", () => {
+       ["K1M3P5R7", "found", 1],
+     ]);
+     assert.deepEqual(r.summary, { words: 6, unique: 3, found: 2, notFound: 1, ignored: 1, repeats: 2 });
++    assert.equal(r.hasPlacements, false);
++    assert.ok(r.rows.every((x) => Array.isArray(x.companies) && x.companies.length === 0));
+   });
+ 
+   it("empty text returns an empty result", async () => {
+diff --git a/tests/placements.test.ts b/tests/placements.test.ts
+new file mode 100644
+index 0000000..8559229
+--- /dev/null
++++ b/tests/placements.test.ts
+@@ -0,0 +1,188 @@
++import assert from "node:assert/strict";
++import { before, describe, it } from "node:test";
++import { getReadyDb } from "../src/lib/db";
++import { cleanCompanyName, changePlacements } from "../src/lib/placements";
++import { HttpError, adminSummary, applyUpload, lookupStudents, validateUpload } from "../src/lib/students";
++import { nextSort, sortRows } from "../src/lib/sort";
++import { freshDb } from "./helpers";
++
++describe("Company names", () => {
++  it("trims, collapses spaces, and matches ignoring case", () => {
++    assert.deepEqual(cleanCompanyName("  Tata   Consultancy\tServices "), { name: "Tata Consultancy Services", key: "tata consultancy services" });
++    assert.equal(cleanCompanyName("TCS").key, cleanCompanyName(" tcs ").key);
++    assert.equal(cleanCompanyName("Ｔｃｓ").key, "tcs", "full-width letters match too");
++  });
++  it("rejects empty, non-text and over-long names", () => {
++    for (const bad of ["", "   ", "\n\t", null, undefined, 5, {}]) assert.throws(() => cleanCompanyName(bad), HttpError);
++    assert.throws(() => cleanCompanyName("x".repeat(101)), HttpError);
++    assert.doesNotThrow(() => cleanCompanyName("x".repeat(100)));
++  });
++});
++
++describe("Placements", () => {
++  let db: Awaited<ReturnType<typeof freshDb>>;
++  before(async () => {
++    await freshDb();
++    db = await getReadyDb();
++    await applyUpload(db, validateUpload({
++      rows: [
++        { neoId: "A1B2C3D4", values: { full_name: "Asha" } },
++        { neoId: "K1M3P5R7", values: { full_name: "Ravi" } },
++        { neoId: "T2V4X6Z8", values: { full_name: "Meera" } },
++      ],
++      columns: [{ key: "full_name", label: "Name" }], overwrite: false, dryRun: false,
++    }));
++  });
++
++  const add = (company: string, text: string) => changePlacements(db, { action: "add", company, text });
++  const remove = (company: string, text: string) => changePlacements(db, { action: "remove", company, text });
++
++  it("places pasted IDs, ignoring non-ID words and repeats", async () => {
++    const r = await add("Google", "A1B2C3D4 12:00 PM 21st K1M3P5R7, a1b2c3d4");
++    assert.equal(r.company, "Google");
++    assert.equal(r.ids, 2);
++    assert.equal(r.ignored, 3); // 12:00, PM, 21st
++    assert.equal(r.added, 2);
++    assert.equal(r.alreadyIn, 0);
++    assert.deepEqual(r.unknownStudents, { count: 0, sample: [] });
++  });
++
++  it("is idempotent: adding the same students again changes nothing", async () => {
++    const r = await add("Google", "A1B2C3D4 K1M3P5R7");
++    assert.equal(r.added, 0);
++    assert.equal(r.alreadyIn, 2);
++  });
++
++  it("matches the company ignoring case and keeps the first spelling", async () => {
++    const r = await add("  GOOGLE ", "T2V4X6Z8");
++    assert.equal(r.company, "Google");
++    assert.equal(r.added, 1);
++    assert.deepEqual((await adminSummary(db)).companies, [{ name: "Google", count: 3 }]);
++  });
++
++  it("lets one student be in several companies, listed alphabetically", async () => {
++    await add("Amazon", "A1B2C3D4");
++    await add("microsoft", "A1B2C3D4 K1M3P5R7");
++    const r = await lookupStudents(db, "A1B2C3D4 K1M3P5R7 T2V4X6Z8 Z9Z9Z9Z9");
++    assert.equal(r.hasPlacements, true);
++    assert.deepEqual(r.rows.map((x) => [x.neoId, x.companies]), [
++      ["A1B2C3D4", ["Amazon", "Google", "microsoft"]],
++      ["K1M3P5R7", ["Google", "microsoft"]],
++      ["T2V4X6Z8", ["Google"]],
++      ["Z9Z9Z9Z9", []],
++    ]);
++    assert.deepEqual((await adminSummary(db)).companies.map((c) => [c.name, c.count]), [["Amazon", 1], ["Google", 3], ["microsoft", 2]]);
++  });
++
++  it("saves placements for IDs with no student record yet, and reports them", async () => {
++    const r = await add("Adobe", "E9G7J5L3 A1B2C3D4 N8Q6S4U2");
++    assert.equal(r.added, 3);
++    assert.deepEqual(r.unknownStudents, { count: 2, sample: ["E9G7J5L3", "N8Q6S4U2"] });
++    const l = await lookupStudents(db, "E9G7J5L3");
++    assert.equal(l.rows[0].status, "not_found");
++    assert.deepEqual(l.rows[0].companies, ["Adobe"]);
++  });
++
++  it("removes only the IDs named, and counts IDs that weren't there", async () => {
++    const r = await remove("google", "A1B2C3D4 N8Q6S4U2");
++    assert.equal(r.removed, 1);
++    assert.equal(r.notIn, 1);
++    assert.equal(r.companyGone, false);
++    assert.deepEqual((await lookupStudents(db, "A1B2C3D4")).rows[0].companies, ["Adobe", "Amazon", "microsoft"]);
++  });
++
++  it("removes a company once its last student is taken out", async () => {
++    const r = await remove("Amazon", "A1B2C3D4");
++    assert.equal(r.companyGone, true);
++    assert.ok(!(await adminSummary(db)).companies.some((c) => c.name === "Amazon"));
++  });
++
++  it("deletes a whole company and its placements", async () => {
++    const r = await changePlacements(db, { action: "delete_company", company: "MICROSOFT" });
++    assert.equal(r.removed, 2);
++    assert.equal(r.companyGone, true);
++    assert.deepEqual((await lookupStudents(db, "K1M3P5R7")).rows[0].companies, ["Google"]);
++  });
++
++  it("refuses unknown companies, empty pastes and bad names", async () => {
++    await assert.rejects(remove("Nope Inc", "A1B2C3D4"), { status: 404 });
++    await assert.rejects(changePlacements(db, { action: "delete_company", company: "Nope Inc" }), { status: 404 });
++    await assert.rejects(add("Google", "12:00 PM nothing here"), { status: 400 });
++    await assert.rejects(add("Google", ""), { status: 400 });
++    await assert.rejects(add("", "A1B2C3D4"), { status: 400 });
++    await assert.rejects(changePlacements(db, { action: "add", company: "Google", text: 5 }), { status: 400 });
++    assert.equal((await adminSummary(db)).companies.some((c) => c.name === ""), false, "no blank company was created");
++  });
++
++  it("a failed add leaves nothing half-written", async () => {
++    const before = (await adminSummary(db)).companies.length;
++    await assert.rejects(add("Ghost Co", "no ids at all"));
++    assert.equal((await adminSummary(db)).companies.length, before, "no empty company was created");
++  });
++
++  it("is safe against SQL tricks in names and IDs", async () => {
++    await add(`x'); drop table placements; --`, "A1B2C3D4");
++    assert.ok((await adminSummary(db)).companies.some((c) => c.name.startsWith("x')")));
++    assert.ok((await lookupStudents(db, "A1B2C3D4")).rows[0].companies.length >= 1);
++  });
++
++  it("lookup shows no Companies column data before any placement exists", async () => {
++    await freshDb();
++    const fresh = await getReadyDb();
++    const r = await lookupStudents(fresh, "A1B2C3D4");
++    assert.equal(r.hasPlacements, false);
++    assert.deepEqual(r.rows[0].companies, []);
++  });
++});
++
++describe("Sorting", () => {
++  type R = { id: string; v?: string | number };
++  const rows = (...vs: (string | number | undefined)[]): R[] => vs.map((v, i) => ({ id: `r${i}`, v }));
++  const ids = (rs: R[]) => rs.map((r) => r.id).join(",");
++  const val = (r: R) => r.v;
++
++  it("sorts numbers numerically, both directions", () => {
++    const rs = rows(8.9, 10, 8.64, 9.08);
++    assert.deepEqual(sortRows(rs, val, "asc").map(val), [8.64, 8.9, 9.08, 10]);
++    assert.deepEqual(sortRows(rs, val, "desc").map(val), [10, 9.08, 8.9, 8.64]);
++  });
++
++  it("sorts text naturally and ignoring case", () => {
++    const rs = rows("99XYZ10034", "99xyz7271", "99XYZ1062", "Zed", "amy");
++    assert.deepEqual(sortRows(rs, val, "asc").map(val), ["99XYZ1062", "99xyz7271", "99XYZ10034", "amy", "Zed"]);
++    assert.deepEqual(sortRows(rs, val, "desc").map(val), ["Zed", "amy", "99XYZ10034", "99xyz7271", "99XYZ1062"]);
++  });
++
++  it("keeps empty cells at the bottom in both directions", () => {
++    const rs = rows(undefined, 3, "", 1, 2);
++    assert.deepEqual(sortRows(rs, val, "asc").map(val), [1, 2, 3, undefined, ""]);
++    assert.deepEqual(sortRows(rs, val, "desc").map(val), [3, 2, 1, undefined, ""]);
++  });
++
++  it("treats zero as a value, not as empty", () => {
++    assert.deepEqual(sortRows(rows(2, 0, 1), val, "asc").map(val), [0, 1, 2]);
++  });
++
++  it("keeps ties in their original order, in both directions", () => {
++    const rs = rows("b", "a", "b", "a");
++    assert.equal(ids(sortRows(rs, val, "asc")), "r1,r3,r0,r2");
++    assert.equal(ids(sortRows(rs, val, "desc")), "r0,r2,r1,r3");
++  });
++
++  it("does not modify the input array", () => {
++    const rs = rows(3, 1, 2);
++    sortRows(rs, val, "asc");
++    assert.deepEqual(rs.map(val), [3, 1, 2]);
++  });
++
++  it("header clicks: new column ascending, same column flips, and keeps flipping", () => {
++    let s = nextSort(null, "cgpa");
++    assert.deepEqual(s, { key: "cgpa", dir: "asc" });
++    s = nextSort(s, "cgpa");
++    assert.deepEqual(s, { key: "cgpa", dir: "desc" });
++    s = nextSort(s, "cgpa");
++    assert.deepEqual(s, { key: "cgpa", dir: "asc" });
++    s = nextSort(s, "campus");
++    assert.deepEqual(s, { key: "campus", dir: "asc" });
++  });
++});

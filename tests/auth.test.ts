@@ -37,6 +37,7 @@ describe("Admin routes", () => {
   let upload: typeof import("../src/app/api/admin/upload/route");
   let status: typeof import("../src/app/api/admin/status/route");
   let lookup: typeof import("../src/app/api/lookup/route");
+  let placements: typeof import("../src/app/api/admin/placements/route");
 
   before(async () => {
     await freshDb();
@@ -44,6 +45,7 @@ describe("Admin routes", () => {
     upload = await import("../src/app/api/admin/upload/route");
     status = await import("../src/app/api/admin/status/route");
     lookup = await import("../src/app/api/lookup/route");
+    placements = await import("../src/app/api/admin/placements/route");
   });
 
   const payload = { rows: [{ neoId: "A1B2C3D4", values: { full_name: "Asha" } }], columns: [{ key: "full_name", label: "Name" }], overwrite: false, dryRun: false };
@@ -80,7 +82,31 @@ describe("Admin routes", () => {
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.rows[0].data.full_name, "Asha");
-    assert.equal(body.summary.invalid, 1);
+    assert.equal(body.summary.ignored, 1);
+    assert.equal(body.rows.length, 1);
+  });
+
+  it("placements are admin-only, and work for a signed-in admin", async () => {
+    const body = { action: "add", company: "Google", text: "A1B2C3D4" };
+    assert.equal((await placements.POST(jsonReq("/api/admin/placements", body))).status, 401);
+    assert.equal((await placements.POST(jsonReq("/api/admin/placements", body, `${SESSION_COOKIE}=1.deadbeef`))).status, 401);
+
+    const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }, undefined, "5.5.5.5"))).headers.get("set-cookie")!.split(";")[0];
+    const ok = await placements.POST(jsonReq("/api/admin/placements", body, cookie));
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).added, 1);
+
+    // visible to everyone on the public lookup
+    const l = await (await lookup.POST(jsonReq("/api/lookup", { text: "A1B2C3D4" }))).json();
+    assert.deepEqual(l.rows[0].companies, ["Google"]);
+    assert.equal(l.hasPlacements, true);
+
+    assert.equal((await placements.POST(jsonReq("/api/admin/placements", { ...body, action: "explode" }, cookie))).status, 400);
+    assert.equal((await placements.POST(jsonReq("/api/admin/placements", { ...body, company: "  " }, cookie))).status, 400);
+    assert.equal((await placements.POST(jsonReq("/api/admin/placements", { action: "remove", company: "Nope", text: "A1B2C3D4" }, cookie))).status, 404);
+
+    const st = await status.GET(new Request("http://localhost/api/admin/status", { headers: { cookie } }));
+    assert.deepEqual((await st.json()).companies, [{ name: "Google", count: 1 }]);
   });
 
   it("refuses non-JSON bodies and malformed upload bodies", async () => {
@@ -102,14 +128,11 @@ describe("Admin routes", () => {
     for (let i = 0; i < 4; i++) assert.equal((await login.POST(jsonReq("/api/admin/login", { password: "x" }, undefined, "8.8.8.8"))).status, 401);
   });
 
-  it("can require login for lookups", async () => {
-    process.env.REQUIRE_LOGIN_FOR_LOOKUP = "true";
+  it("lookup never needs a sign-in, even if the old setting is present", async () => {
+    process.env.REQUIRE_LOGIN_FOR_LOOKUP = "true"; // retired setting: must have no effect
     try {
-      const res = await lookup.POST(jsonReq("/api/lookup", { text: "A1B2C3D4" }));
-      assert.equal(res.status, 401);
-      assert.equal((await res.json()).loginRequired, true);
-      const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }, undefined, "7.7.7.7"))).headers.get("set-cookie")!.split(";")[0];
-      assert.equal((await lookup.POST(jsonReq("/api/lookup", { text: "A1B2C3D4" }, cookie))).status, 200);
+      const res = await lookup.POST(jsonReq("/api/lookup", { text: "A1B2C3D4" }, undefined, "6.6.6.6"));
+      assert.equal(res.status, 200);
     } finally {
       delete process.env.REQUIRE_LOGIN_FOR_LOOKUP;
     }

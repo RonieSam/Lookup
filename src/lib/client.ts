@@ -4,7 +4,7 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
-    public body?: { error?: string; loginRequired?: boolean },
+    public body?: { error?: string },
   ) {
     super(message);
   }
@@ -19,7 +19,7 @@ export async function api<T>(url: string, options: { method?: string; json?: unk
     credentials: "same-origin",
     cache: "no-store",
   });
-  let body: { error?: string; loginRequired?: boolean } | null = null;
+  let body: { error?: string } | null = null;
   try {
     body = await res.json();
   } catch {

@@ -1,6 +1,13 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+    outputFileTracingIncludes: {
+    "/*": [
+      "./node_modules/pg-cloudflare/dist/**",
+      "./node_modules/pg-cloudflare/esm/**",
+    ],
+  },
   poweredByHeader: false,
+
   async headers() {
     return [
       {
@@ -16,3 +23,5 @@ const nextConfig = {
 };
 
 export default nextConfig;
+
+import('@opennextjs/cloudflare').then(m => m.initOpenNextCloudflareForDev());

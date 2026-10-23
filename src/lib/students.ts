@@ -18,28 +18,32 @@ export const MAX_UPLOAD_ROWS = 1000;
 /* Lookup                                                              */
 /* ------------------------------------------------------------------ */
 
-export type LookupStatus = "found" | "not_found" | "invalid";
+export type LookupStatus = "found" | "not_found";
 
 export interface LookupRow {
   /** The word as typed, minus any wrapping quotes or brackets. */
   input: string;
   neoId: string;
   status: LookupStatus;
-  reason?: string;
   /** How many times this ID appeared in the pasted text. */
   count: number;
   data?: RecordData;
+  /** Companies this student has been placed in, alphabetical. Empty if none. */
+  companies: string[];
 }
 
 export interface LookupResult {
   columns: ColumnDef[];
   rows: LookupRow[];
+  /** True once any placement has been recorded, so the page can show a Companies column. */
+  hasPlacements: boolean;
   summary: {
     words: number;
     unique: number;
     found: number;
     notFound: number;
-    invalid: number;
+    /** Words that aren't Neo IDs (times, dates, labels...). They are dropped, only counted. */
+    ignored: number;
     repeats: number;
   };
 }
@@ -50,12 +54,18 @@ export async function lookupStudents(db: Db, text: string): Promise<LookupResult
     throw new HttpError(413, `Too many words. Paste at most ${MAX_LOOKUP_TOKENS} at a time.`);
   }
 
-  // One row per distinct input, in first-seen order, with repeat counts.
+  // One row per distinct Neo ID, in first-seen order, with repeat counts.
+  // Words that aren't Neo IDs are dropped.
   const rows: LookupRow[] = [];
   const byKey = new Map<string, LookupRow>();
   let repeats = 0;
+  let ignored = 0;
 
   for (const t of classified) {
+    if (t.status === "invalid") {
+      ignored++;
+      continue;
+    }
     if (t.status === "duplicate") {
       byKey.get(t.id)!.count++;
       repeats++;
@@ -64,48 +74,69 @@ export async function lookupStudents(db: Db, text: string): Promise<LookupResult
     const row: LookupRow = {
       input: t.raw,
       neoId: t.id,
-      status: t.status === "invalid" ? "invalid" : "not_found",
-      reason: t.reason,
+      status: "not_found",
       count: 1,
+      companies: [],
     };
     rows.push(row);
-    if (t.status === "valid") byKey.set(t.id, row);
+    byKey.set(t.id, row);
   }
 
   const ids = [...byKey.keys()];
-  if (ids.length > 0) {
-    const { rows: found } = await db.query<{ neo_id: string; data: RecordData }>(
-      `select neo_id, data from students
-       where neo_id in (select jsonb_array_elements_text($1::jsonb))`,
-      [JSON.stringify(ids)],
-    );
-    for (const f of found) {
-      const row = byKey.get(f.neo_id);
-      if (row) {
-        row.status = "found";
-        row.data = f.data;
-      }
-    }
-  }
+  let columns: ColumnDef[] = [];
+  let hasPlacements = false;
 
-  // Only show columns that have a value for at least one student in this result.
-  const { rows: allColumns } = await db.query<ColumnDef>(
-    "select key, label from student_columns order by position",
-  );
-  const used = new Set<string>();
-  for (const r of rows) if (r.data) for (const k of Object.keys(r.data)) used.add(k);
-  const columns = allColumns.filter((c) => used.has(c.key));
+  if (ids.length > 0) {
+    // One transaction, so the three reads share a single database connection.
+    await db.transaction(async (tx) => {
+      const { rows: found } = await tx.query<{ neo_id: string; data: RecordData }>(
+        `select neo_id, data from students
+         where neo_id in (select jsonb_array_elements_text($1::jsonb))`,
+        [JSON.stringify(ids)],
+      );
+      for (const f of found) {
+        const row = byKey.get(f.neo_id);
+        if (row) {
+          row.status = "found";
+          row.data = f.data;
+        }
+      }
+
+      const { rows: placed } = await tx.query<{ neo_id: string; name: string }>(
+        `select p.neo_id, c.name
+         from placements p join companies c on c.key = p.company_key
+         where p.neo_id in (select jsonb_array_elements_text($1::jsonb))
+         order by lower(c.name), c.name`,
+        [JSON.stringify(ids)],
+      );
+      for (const p of placed) byKey.get(p.neo_id)?.companies.push(p.name);
+
+      const { rows: exists } = await tx.query<{ placed: boolean }>(
+        "select exists (select 1 from placements) as placed",
+      );
+      hasPlacements = exists[0]?.placed === true;
+
+      // Only show columns that have a value for at least one student in this result.
+      const { rows: allColumns } = await tx.query<ColumnDef>(
+        "select key, label from student_columns order by position",
+      );
+      const used = new Set<string>();
+      for (const r of rows) if (r.data) for (const k of Object.keys(r.data)) used.add(k);
+      columns = allColumns.filter((c) => used.has(c.key));
+    });
+  }
 
   const count = (s: LookupStatus) => rows.filter((r) => r.status === s).length;
   return {
     columns,
     rows,
+    hasPlacements,
     summary: {
       words: classified.length,
       unique: rows.length,
       found: count("found"),
       notFound: count("not_found"),
-      invalid: count("invalid"),
+      ignored,
       repeats,
     },
   };
@@ -298,10 +329,23 @@ export async function applyUpload(db: Db, input: UploadInput): Promise<UploadSta
 /* Admin summary                                                       */
 /* ------------------------------------------------------------------ */
 
+export interface CompanySummary {
+  name: string;
+  /** How many students are placed in this company. */
+  count: number;
+}
+
 export async function adminSummary(db: Db) {
-  // Sequential on purpose: each request then needs only one database connection,
-  // which matters on free plans with tight connection limits.
-  const { rows: count } = await db.query<{ n: string }>("select count(*)::text as n from students");
-  const { rows: columns } = await db.query<ColumnDef>("select key, label from student_columns order by position");
-  return { studentCount: Number(count[0]?.n ?? 0), columns };
+  // One transaction, so the reads share a single database connection.
+  return db.transaction(async (tx) => {
+    const { rows: count } = await tx.query<{ n: string }>("select count(*)::text as n from students");
+    const { rows: columns } = await tx.query<ColumnDef>("select key, label from student_columns order by position");
+    const { rows: companies } = await tx.query<CompanySummary>(
+      `select c.name, count(p.neo_id)::int as count
+       from companies c left join placements p on p.company_key = c.key
+       group by c.key, c.name
+       order by lower(c.name), c.name`,
+    );
+    return { studentCount: Number(count[0]?.n ?? 0), columns, companies };
+  });
 }

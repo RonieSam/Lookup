@@ -1,4 +1,5 @@
 import type { Db } from "./db";
+import { readEnv } from "./env";
 
 /**
  * Admin sign-in.
@@ -14,7 +15,7 @@ export const SESSION_HOURS = 8;
 const encoder = new TextEncoder();
 
 function requireEnv(name: "ADMIN_PASSWORD" | "SESSION_SECRET"): string {
-  const value = process.env[name];
+  const value = readEnv(name);
   if (!value) throw new Error(`${name} is not set. Add it to the environment.`);
   if (name === "SESSION_SECRET" && value.length < 16) {
     throw new Error("SESSION_SECRET must be at least 16 characters.");
@@ -80,8 +81,10 @@ export const MAX_FAILS = 5;
 export const WINDOW_MINUTES = 15;
 
 export function clientIp(request: Request): string {
+  // Cloudflare sets cf-connecting-ip; Vercel and most proxies set x-forwarded-for.
+  const cf = request.headers.get("cf-connecting-ip");
   const forwarded = request.headers.get("x-forwarded-for");
-  return (forwarded?.split(",")[0] ?? request.headers.get("x-real-ip") ?? "unknown").trim().slice(0, 64);
+  return (cf ?? forwarded?.split(",")[0] ?? request.headers.get("x-real-ip") ?? "unknown").trim().slice(0, 64);
 }
 
 /** Minutes left on the lockout for this IP, or 0 if it may try. */

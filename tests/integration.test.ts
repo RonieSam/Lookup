@@ -30,7 +30,7 @@ describe("Upload and lookup", () => {
     ], base);
     assert.equal(stats.newStudents, 2);
     assert.deepEqual(stats.newColumns, ["full_name", "cgpa"]);
-    assert.deepEqual(await adminSummary(db), { studentCount: 2, columns: base });
+    assert.deepEqual(await adminSummary(db), { studentCount: 2, columns: base, companies: [] });
   });
 
   it("dry run reports the same numbers and writes nothing", async () => {
@@ -62,16 +62,16 @@ describe("Upload and lookup", () => {
     assert.deepEqual(after, { full_name: "Asha", cgpa: 9.9, email: "asha@x.in" });
   });
 
-  it("lookup classifies every word and counts repeats", async () => {
+  it("lookup drops non-ID words, classifies IDs and counts repeats", async () => {
     const r = await lookupStudents(db, "A1B2C3D4, a1b2c3d4 Z9Z9Z9Z9 BAD123 K1M3P5R7\nA1B2C3D4");
     assert.deepEqual(r.rows.map((x) => [x.neoId, x.status, x.count]), [
       ["A1B2C3D4", "found", 3],
       ["Z9Z9Z9Z9", "not_found", 1],
-      ["BAD123", "invalid", 1],
       ["K1M3P5R7", "found", 1],
     ]);
-    assert.deepEqual(r.summary, { words: 6, unique: 4, found: 2, notFound: 1, invalid: 1, repeats: 2 });
-    assert.match(r.rows[2].reason!, /6 characters/);
+    assert.deepEqual(r.summary, { words: 6, unique: 3, found: 2, notFound: 1, ignored: 1, repeats: 2 });
+    assert.equal(r.hasPlacements, false);
+    assert.ok(r.rows.every((x) => Array.isArray(x.companies) && x.companies.length === 0));
   });
 
   it("empty text returns an empty result", async () => {
@@ -134,7 +134,7 @@ describe("Your real spreadsheet", { skip: !SAMPLE || !existsSync(SAMPLE) }, () =
     // Every student comes back with exactly the values the spreadsheet holds.
     const all = await lookupStudents(db, report.rows.map((r) => r.neoId).join("\n"));
     assert.equal(all.summary.found, 4351);
-    assert.equal(all.summary.invalid + all.summary.notFound, 0);
+    assert.equal(all.summary.ignored + all.summary.notFound, 0);
     const expected = new Map(report.rows.map((r) => [r.neoId, r.values]));
     for (const row of all.rows) assert.deepEqual(row.data, expected.get(row.neoId), row.neoId);
 
@@ -143,8 +143,8 @@ describe("Your real spreadsheet", { skip: !SAMPLE || !existsSync(SAMPLE) }, () =
     const mixed = await lookupStudents(db, `${sample.toLowerCase()} NOPE0000 A1B2C3`);
     assert.equal(mixed.rows[0].status, "found");
     assert.deepEqual(mixed.rows[0].data, expected.get(sample));
-    assert.equal(mixed.rows[1].status, "invalid");
-    assert.equal(mixed.rows[2].status, "invalid");
+    assert.equal(mixed.rows.length, 1, "non-ID words produce no rows");
+    assert.equal(mixed.summary.ignored, 2);
 
     // Re-uploading the same file changes nothing.
     const again = await applyUpload(db, validateUpload({ rows: report.rows.slice(0, 500), columns, overwrite: true, dryRun: true }));

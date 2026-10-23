@@ -33,7 +33,24 @@ export function handle(fn: (request: Request) => Promise<Response>) {
       // Missing configuration is the most common first-deploy problem; say so plainly.
       const message = err instanceof Error ? err.message : "";
       if (/is not set|must be at least/.test(message)) return json({ error: message }, 500);
+      const hint = databaseHint(err);
+      if (hint) return json({ error: hint }, 500);
       return json({ error: "Something went wrong on the server. Check the deployment logs." }, 500);
     }
   };
+}
+
+/**
+ * Explains a database connection failure without echoing the driver's message,
+ * which can include the database user name.
+ */
+export function databaseHint(err: unknown): string | null {
+  const code = (err as { code?: unknown })?.code;
+  if (code === "28P01") return "The database rejected the password. Copy DATABASE_URL again from Neon.";
+  if (code === "3D000") return "That database name doesn't exist. Check the end of DATABASE_URL.";
+  if (code === "28000" || code === "42501") return "The database user isn't allowed to do that. Check DATABASE_URL.";
+  if (typeof code === "string" && /^(ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ECONNRESET)$/.test(code)) {
+    return "Couldn't reach the database. Check the host in DATABASE_URL.";
+  }
+  return null;
 }

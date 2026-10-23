@@ -1,4 +1,5 @@
-import { Pool } from "pg";
+import { Client } from "@neondatabase/serverless";
+import { readEnv } from "./env";
 
 /** The small slice of a Postgres client the app needs. Tests swap in their own. */
 export interface Db {
@@ -7,26 +8,63 @@ export interface Db {
   transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T>;
 }
 
-function pgAdapter(connectionString: string): Db {
-  const pool = new Pool({ connectionString, max: 3, idleTimeoutMillis: 10_000 });
+type NeonClient = InstanceType<typeof Client>;
+
+/**
+ * Neon's serverless driver talks to Postgres over WebSockets, so it runs on
+ * Cloudflare Workers, Vercel and Node alike (the standard `pg` driver needs raw
+ * TCP sockets, which Workers doesn't have).
+ *
+ * A WebSocket can't outlive the request that opened it on a serverless
+ * platform, so nothing is pooled: each query or transaction opens a
+ * connection, does its work, and closes it before returning.
+ */
+function neonAdapter(connectionString: string): Db {
+  const wrap = (client: NeonClient): Db => ({
+    query: async <T>(sql: string, params?: unknown[]) =>
+      (await client.query(sql, params as unknown[])) as unknown as { rows: T[] },
+    transaction: (fn) => fn(wrap(client)), // already inside a transaction
+  });
+
+  const open = async () => {
+    const client = new Client({ connectionString });
+    await client.connect();
+    return client;
+  };
+  // Closing normally takes one round trip. The cap means a connection that never
+  // acknowledges the close can't hold up the response.
+  const close = async (client: NeonClient) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      client.end().catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 2000);
+      }),
+    ]);
+    clearTimeout(timer);
+  };
+
   return {
-    query: async <T>(sql: string, params?: unknown[]) => (await pool.query(sql, params)) as unknown as { rows: T[] },
+    async query<T>(sql: string, params?: unknown[]) {
+      const client = await open();
+      try {
+        return (await client.query(sql, params as unknown[])) as unknown as { rows: T[] };
+      } finally {
+        await close(client);
+      }
+    },
     async transaction(fn) {
-      const client = await pool.connect();
-      const tx: Db = {
-        query: async <T>(sql: string, params?: unknown[]) => (await client.query(sql, params)) as unknown as { rows: T[] },
-        transaction: (inner) => inner(tx), // already inside a transaction
-      };
+      const client = await open();
       try {
         await client.query("BEGIN");
-        const result = await fn(tx);
+        const result = await fn(wrap(client));
         await client.query("COMMIT");
         return result;
       } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
         throw err;
       } finally {
-        client.release();
+        await close(client);
       }
     },
   };
@@ -45,11 +83,11 @@ export function setDb(db: Db | undefined) {
 
 function getDb(): Db {
   if (!globalForDb.__neoDb) {
-    const url = process.env.DATABASE_URL;
+    const url = readEnv("DATABASE_URL");
     if (!url) {
-      throw new Error("DATABASE_URL is not set. Add your Postgres connection string to the environment.");
+      throw new Error("DATABASE_URL is not set. Add your Neon connection string to the environment.");
     }
-    globalForDb.__neoDb = pgAdapter(url);
+    globalForDb.__neoDb = neonAdapter(url);
   }
   return globalForDb.__neoDb;
 }
@@ -74,6 +112,22 @@ async function ensureSchema(db: Db): Promise<void> {
         label    text not null,
         position integer not null
       )`);
+    await tx.query(`
+      create table if not exists companies (
+        key        text primary key,
+        name       text not null,
+        created_at timestamptz not null default now()
+      )`);
+    // One row per (student, company), so a student can be placed in several companies.
+    // No foreign key to students: a placement can be recorded before the student is uploaded.
+    await tx.query(`
+      create table if not exists placements (
+        neo_id      text not null check (neo_id ~ '^([A-Z][0-9]){4}$'),
+        company_key text not null references companies (key) on delete cascade,
+        created_at  timestamptz not null default now(),
+        primary key (neo_id, company_key)
+      )`);
+    await tx.query("create index if not exists placements_company_idx on placements (company_key)");
     await tx.query(`
       create table if not exists login_throttle (
         ip           text primary key,

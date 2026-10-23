@@ -4,11 +4,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { NeoIdText } from "@/components/NeoIdText";
 import { ApiError, api } from "@/lib/client";
 import { buildMapping, detectNeoColumn, parseRows, type MappedColumn } from "@/lib/columns";
-import type { UploadStats } from "@/lib/students";
+import { classifyTokens, tokenize } from "@/lib/neo";
+import type { PlacementResult } from "@/lib/placements";
+import type { CompanySummary, UploadStats } from "@/lib/students";
 
 interface Summary {
   studentCount: number;
   columns: { key: string; label: string }[];
+  companies: CompanySummary[];
 }
 
 interface ParsedFile {
@@ -137,6 +140,10 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () => 
             <b>{summary.columns.length}</b>
             <span>detail columns</span>
           </div>
+          <div className="stat">
+            <b>{summary.companies.length}</b>
+            <span>{summary.companies.length === 1 ? "company" : "companies"}</span>
+          </div>
         </div>
         {summary.columns.length > 0 ? (
           <div className="cols">
@@ -152,7 +159,203 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () => 
       </section>
 
       <Uploader summary={summary} onChanged={onChanged} />
+      <Placements summary={summary} onChanged={onChanged} />
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+
+function describePlacement(r: PlacementResult): string {
+  const students = (n: number) => `${fmt(n)} ${n === 1 ? "student" : "students"}`;
+  const parts: string[] = [];
+  if (r.action === "add") {
+    parts.push(`Added ${students(r.added)} to ${r.company}.`);
+    if (r.alreadyIn > 0) parts.push(`${fmt(r.alreadyIn)} ${r.alreadyIn === 1 ? "was" : "were"} already in it.`);
+  } else if (r.action === "remove") {
+    parts.push(`Removed ${students(r.removed)} from ${r.company}.`);
+    if (r.notIn > 0) parts.push(`${fmt(r.notIn)} ${r.notIn === 1 ? "wasn't" : "weren't"} in it.`);
+    if (r.companyGone) parts.push("That was the last student, so the company was removed.");
+  } else {
+    parts.push(`Deleted ${r.company} and its ${students(r.removed)}.`);
+  }
+  if (r.ignored > 0) parts.push(`${fmt(r.ignored)} other ${r.ignored === 1 ? "word" : "words"} ignored.`);
+  return parts.join(" ");
+}
+
+function Placements({ summary, onChanged }: { summary: Summary; onChanged: () => Promise<void> }) {
+  const [company, setCompany] = useState("");
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<PlacementResult | null>(null);
+
+  const counts = useMemo(() => {
+    const all = classifyTokens(tokenize(text));
+    return {
+      ids: all.filter((t) => t.status === "valid").length,
+      repeats: all.filter((t) => t.status === "duplicate").length,
+      ignored: all.filter((t) => t.status === "invalid").length,
+    };
+  }, [text]);
+
+  async function run(action: "add" | "remove" | "delete_company", name: string) {
+    setBusy(true);
+    setError(null);
+    setDone(null);
+    try {
+      const result = await api<PlacementResult>("/api/admin/placements", { json: { action, company: name, text } });
+      setDone(result);
+      if (action !== "delete_company") {
+        setCompany("");
+        setText("");
+      }
+      await onChanged();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        await onChanged(); // session expired: back to the sign-in form
+        return;
+      }
+      setError(err instanceof Error ? err.message : "That didn't work.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const ready = company.trim() !== "" && counts.ids > 0 && !busy;
+
+  return (
+    <section className="card" aria-labelledby="pl-title">
+      <h2 id="pl-title">Placements</h2>
+      <p className="lede">
+        Choose a company and paste the Neo IDs of the students placed in it. A student can be in as many companies as
+        you like. Company names match ignoring capital letters, so "tcs" and "TCS" are one company.
+      </p>
+
+      <div className="stack">
+        <div>
+          <label htmlFor="company">Company</label>
+          <input
+            id="company"
+            type="text"
+            list="company-names"
+            autoComplete="off"
+            maxLength={100}
+            value={company}
+            disabled={busy}
+            onChange={(e) => setCompany(e.target.value)}
+          />
+          <datalist id="company-names">
+            {summary.companies.map((c) => (
+              <option key={c.name} value={c.name} />
+            ))}
+          </datalist>
+        </div>
+
+        <div>
+          <label htmlFor="placed-ids">Neo IDs</label>
+          <textarea
+            id="placed-ids"
+            value={text}
+            disabled={busy}
+            spellCheck={false}
+            autoCapitalize="characters"
+            autoComplete="off"
+            placeholder={"A1B2C3D4 K1M3P5R7\nT2V4X6Z8"}
+            style={{ minHeight: 120 }}
+            onChange={(e) => setText(e.target.value)}
+          />
+          <p className="hint">
+            {counts.ids === 0 && counts.ignored === 0 ? (
+              <>Anything that isn't a Neo ID is ignored, so you can paste a whole list or email.</>
+            ) : (
+              <>
+                <b>{fmt(counts.ids)}</b> Neo {counts.ids === 1 ? "ID" : "IDs"}
+                {counts.repeats > 0 && <> · {fmt(counts.repeats)} repeated</>}
+                {counts.ignored > 0 && (
+                  <>
+                    {" "}
+                    · {fmt(counts.ignored)} other {counts.ignored === 1 ? "word" : "words"} ignored
+                  </>
+                )}
+              </>
+            )}
+          </p>
+        </div>
+
+        <div className="row">
+          <button className="btn primary" onClick={() => run("add", company)} disabled={!ready}>
+            {busy ? "Saving…" : "Add to company"}
+          </button>
+          <button className="btn" onClick={() => run("remove", company)} disabled={!ready}>
+            Remove from company
+          </button>
+        </div>
+
+        {error && (
+          <div className="notice bad" role="alert">
+            {error}
+          </div>
+        )}
+        {done && (
+          <div className="notice ok" role="status">
+            {describePlacement(done)}
+          </div>
+        )}
+        {done && done.action === "add" && done.unknownStudents.count > 0 && (
+          <div className="notice warn" role="status">
+            {fmt(done.unknownStudents.count)} {done.unknownStudents.count === 1 ? "Neo ID has" : "Neo IDs have"} no student
+            record yet, so only the company is saved for them. If that's a typo, remove{" "}
+            {done.unknownStudents.count === 1 ? "it" : "them"} from the company and add the right ID:{" "}
+            {done.unknownStudents.sample.slice(0, 10).map((id, i) => (
+              <span key={id}>
+                {i > 0 && ", "}
+                <NeoIdText id={id} />
+              </span>
+            ))}
+            {done.unknownStudents.count > 10 && <> and {fmt(done.unknownStudents.count - 10)} more</>}
+          </div>
+        )}
+      </div>
+
+      {summary.companies.length > 0 && (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Company</th>
+                <th scope="col">Students</th>
+                <th scope="col">
+                  <span className="sr-only">Actions</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.companies.map((c) => (
+                <tr key={c.name}>
+                  <td>{c.name}</td>
+                  <td className="num">{fmt(c.count)}</td>
+                  <td style={{ textAlign: "right" }}>
+                    <button
+                      className="btn quiet"
+                      disabled={busy}
+                      aria-label={`Delete ${c.name}`}
+                      onClick={() => {
+                        if (window.confirm(`Delete ${c.name} and remove all ${fmt(c.count)} of its placements? This can't be undone.`)) {
+                          run("delete_company", c.name);
+                        }
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 
