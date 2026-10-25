@@ -1,0 +1,739 @@
+diff --git a/README.md b/README.md
+index c6a9079..d730624 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,12 @@ On the admin page, type a company name, paste the Neo IDs of the students placed
+ - **Undo.** **Remove from company** takes the pasted students out of that company. A company with nobody left disappears. The table of companies has a **Delete** button that removes a company and all its placements.
+ - Placements are public on the lookup page like the rest of a student's details.
+ 
++## Searching
++
++- **On the lookup page**, the *Search these results* box narrows the table you're looking at. A row stays when every word you typed is found somewhere in it: Neo ID, any detail column, or Companies. Matching ignores capital letters and works on part of a word, so `chen 9.1` finds a student whose name contains "chen" and who has a 9.1 anywhere. Matching cells are highlighted. It combines with the Found / Not found buttons and with sorting, starts fresh on each new lookup, and Copy table and Download CSV follow what's on screen.
++- **On the admin page**, *Find students* searches everything stored, not just one lookup: every Neo ID, every detail column and company names. The same rules apply (all words must match, part of a word is enough). Students who only have placements are included. At most 100 matches are shown, with the true total, so add a word to narrow a large result. Column headings aren't searched, only the values.
++- The admin search is **admin-only on purpose**: the lookup page needs you to already know an ID, while this search could list students by any detail.
++
+ ## Who can see what
+ 
+ - **Uploads and the admin page** need the admin password. The password is checked on the server, the session is a signed `HttpOnly` cookie that lasts 8 hours, and five wrong passwords lock an IP out for 15 minutes.
+@@ -95,6 +101,8 @@ Next.js (App Router) and TypeScript. Each student is one row: the Neo ID plus a
+ | `src/lib/students.ts` | Lookup, upload validation, preview and save |
+ | `src/lib/placements.ts` | Company names, adding and removing placements |
+ | `src/lib/sort.ts` | Column sorting for the results table |
++| `src/lib/search.ts` | Search rules shared by the lookup page and the admin search |
++| `src/lib/find.ts` | The admin search over all stored data |
+ | `src/lib/auth.ts` | Password check, session cookie, login throttle |
+ | `src/lib/db.ts` | Database access through Neon's serverless driver (one short-lived connection per operation) |
+ | `src/lib/env.ts` | Reads settings from `process.env` or, on Workers, from Cloudflare bindings |
+diff --git a/src/app/admin/page.tsx b/src/app/admin/page.tsx
+index 6db8228..a2453c7 100644
+--- a/src/app/admin/page.tsx
++++ b/src/app/admin/page.tsx
+@@ -4,8 +4,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
+ import { NeoIdText } from "@/components/NeoIdText";
+ import { ApiError, api } from "@/lib/client";
+ import { buildMapping, detectNeoColumn, parseRows, type MappedColumn } from "@/lib/columns";
++import type { FindResult } from "@/lib/find";
+ import { classifyTokens, tokenize } from "@/lib/neo";
+ import type { PlacementResult } from "@/lib/placements";
++import { cellHas } from "@/lib/search";
+ import type { CompanySummary, UploadStats } from "@/lib/students";
+ 
+ interface Summary {
+@@ -158,6 +160,7 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () =>
+         )}
+       </section>
+ 
++      <FindStudents summary={summary} onChanged={onChanged} />
+       <Uploader summary={summary} onChanged={onChanged} />
+       <Placements summary={summary} onChanged={onChanged} />
+     </div>
+@@ -166,6 +169,138 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () =>
+ 
+ /* ------------------------------------------------------------------ */
+ 
++function FindStudents({ summary, onChanged }: { summary: Summary; onChanged: () => Promise<void> }) {
++  const [q, setQ] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [found, setFound] = useState<{ result: FindResult; query: string } | null>(null);
++
++  async function run(e: React.FormEvent) {
++    e.preventDefault();
++    if (busy || q.trim() === "") return;
++    setBusy(true);
++    setError(null);
++    try {
++      setFound({ result: await api<FindResult>("/api/admin/search", { json: { q } }), query: q.trim() });
++    } catch (err) {
++      if (err instanceof ApiError && err.status === 401) {
++        await onChanged(); // session expired: back to the sign-in form
++        return;
++      }
++      setError(err instanceof Error ? err.message : "The search failed.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const terms = found?.result.terms ?? [];
++  const hit = (text: string) => terms.some((t) => cellHas(text, t));
++
++  return (
++    <section className="card" aria-labelledby="find-title">
++      <h2 id="find-title">Find students</h2>
++      <form onSubmit={run}>
++        <label htmlFor="find-q">Search everything stored</label>
++        <div className="searchbar">
++          <input
++            id="find-q"
++            type="search"
++            value={q}
++            autoComplete="off"
++            spellCheck={false}
++            maxLength={100}
++            placeholder="Name, registration number, Neo ID, campus, company…"
++            onChange={(e) => setQ(e.target.value)}
++          />
++          <button className="btn primary" disabled={busy || q.trim() === ""}>
++            {busy ? "Searching…" : "Search"}
++          </button>
++        </div>
++        <p className="hint">
++          Looks in the Neo ID, every detail column and company names. Capital letters don't matter, and part of a word is
++          enough. With several words, each one has to match somewhere in the student's details.
++        </p>
++      </form>
++
++      {error && (
++        <div className="notice bad" role="alert">
++          {error}
++        </div>
++      )}
++
++      {found && (
++        <div role="status">
++          {found.result.total === 0 ? (
++            <p className="empty">Nothing matches “{found.query}”.</p>
++          ) : (
++            <>
++              <p className="hint">
++                {found.result.total > found.result.hits.length
++                  ? `Showing the first ${fmt(found.result.hits.length)} of ${fmt(found.result.total)} matches. Add a word to narrow it down.`
++                  : `${fmt(found.result.total)} ${found.result.total === 1 ? "match" : "matches"}.`}
++              </p>
++              <div className="table-wrap">
++                <table>
++                  <thead>
++                    <tr>
++                      <th scope="col">Neo ID</th>
++                      {summary.columns.map((c) => (
++                        <th key={c.key} scope="col">
++                          {c.label}
++                        </th>
++                      ))}
++                      <th scope="col">Companies</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {found.result.hits.map((h) => (
++                      <tr key={h.neoId}>
++                        <td className={hit(h.neoId) ? "hit" : undefined}>
++                          <NeoIdText id={h.neoId} />
++                        </td>
++                        {h.inStudents ? (
++                          summary.columns.map((c) => {
++                            const v = h.data[c.key];
++                            const text = v === undefined ? "" : String(v);
++                            return (
++                              <td key={c.key} className={[typeof v === "number" ? "num" : "", hit(text) ? "hit" : ""].filter(Boolean).join(" ") || undefined}>
++                                {text}
++                              </td>
++                            );
++                          })
++                        ) : (
++                          <td className="note" colSpan={Math.max(summary.columns.length, 1)}>
++                            No student record yet (only placements are saved for this Neo ID).
++                          </td>
++                        )}
++                        <td className={hit(h.companies.join(" ")) ? "hit" : undefined}>
++                          {h.companies.length > 0 ? (
++                            <span className="companies">
++                              {h.companies.map((name) => (
++                                <span key={name} className="badge info">
++                                  {name}
++                                </span>
++                              ))}
++                            </span>
++                          ) : (
++                            <span className="none">—</span>
++                          )}
++                        </td>
++                      </tr>
++                    ))}
++                  </tbody>
++                </table>
++              </div>
++            </>
++          )}
++        </div>
++      )}
++    </section>
++  );
++}
++
++/* ------------------------------------------------------------------ */
++
+ function describePlacement(r: PlacementResult): string {
+   const students = (n: number) => `${fmt(n)} ${n === 1 ? "student" : "students"}`;
+   const parts: string[] = [];
+diff --git a/src/app/api/admin/search/route.ts b/src/app/api/admin/search/route.ts
+new file mode 100644
+index 0000000..f5bf960
+--- /dev/null
++++ b/src/app/api/admin/search/route.ts
+@@ -0,0 +1,13 @@
++import { getReadyDb } from "@/lib/db";
++import { findStudents } from "@/lib/find";
++import { handle, json, readJson, requireAdmin } from "@/lib/http";
++
++/**
++ * Admin-only on purpose. Looking a student up needs their Neo ID, but searching
++ * by name, number or company would let anyone list the whole student database.
++ */
++export const POST = handle(async (request) => {
++  await requireAdmin(request);
++  const body = (await readJson(request)) as { q?: unknown };
++  return json(await findStudents(await getReadyDb(), body?.q));
++});
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 4adb8df..b0fc6f7 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -73,7 +73,7 @@ nav a:hover { color: var(--ink); text-decoration: underline; }
+ 
+ /* ---------- form controls ---------- */
+ label { font-weight: 600; display: block; margin-bottom: 6px; }
+-textarea, input[type="password"], input[type="text"], select {
++textarea, input[type="password"], input[type="text"], input[type="search"], select {
+   width: 100%;
+   font: inherit;
+   color: var(--ink);
+@@ -162,6 +162,10 @@ th[aria-sort] { padding: 0; }
+ th[aria-sort="ascending"] .sort-mark, th[aria-sort="descending"] .sort-mark { color: var(--accent); }
+ .companies { display: flex; flex-wrap: wrap; gap: 4px; }
+ .none { color: var(--muted); }
++.searchbar { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
++.searchbar input { flex: 1; min-width: 0; }
++input[type="search"]::-webkit-search-cancel-button { display: none; }
++td.hit { background: var(--accent-soft); }
+ .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+ td.note { color: var(--muted); }
+ .badge {
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index a363215..90212d2 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -4,6 +4,7 @@ import { useMemo, useRef, useState } from "react";
+ import { NeoIdText } from "@/components/NeoIdText";
+ import { api, downloadText, formatCell, toCsv, toTsv } from "@/lib/client";
+ import { classifyTokens, tokenize } from "@/lib/neo";
++import { cellHas, rowMatches, searchTerms } from "@/lib/search";
+ import { nextSort, sortRows, type SortState, type SortValue } from "@/lib/sort";
+ import type { LookupResult, LookupRow, LookupStatus } from "@/lib/students";
+ 
+@@ -29,6 +30,18 @@ function sortValue(r: LookupRow, key: string): SortValue {
+   return typeof v === "boolean" ? formatCell(v) : v;
+ }
+ 
++/**
++ * The text of each searchable column in a row: Neo ID, the detail columns, then Companies.
++ * Status isn't searched ("found" is inside "Not found"); the Found / Not found buttons filter by it.
++ */
++function searchCells(r: LookupRow, columns: { key: string }[], showCompanies: boolean): string[] {
++  return [
++    r.neoId,
++    ...columns.map((c) => (r.data ? formatCell(r.data[c.key]) : "")),
++    ...(showCompanies ? [r.companies.join(" ")] : []),
++  ];
++}
++
+ function SortHeader({
+   label,
+   sortKey,
+@@ -61,6 +74,7 @@ export default function LookupPage() {
+   const [filter, setFilter] = useState<Filter>("all");
+   const [copied, setCopied] = useState(false);
+   const [sort, setSort] = useState<SortState | null>(null);
++  const [search, setSearch] = useState("");
+   const resultsRef = useRef<HTMLDivElement>(null);
+ 
+   // Words that aren't Neo IDs (times, dates, labels...) are dropped; they're only counted.
+@@ -83,6 +97,7 @@ export default function LookupPage() {
+       setResult(data);
+       setFilter("all");
+       setSort(null);
++      setSearch("");
+       requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+     } catch (err) {
+       setError(err instanceof Error ? err.message : "The lookup failed.");
+@@ -95,17 +110,30 @@ export default function LookupPage() {
+     setText("");
+     setResult(null);
+     setSort(null);
++    setSearch("");
+     setError(null);
+   }
+ 
+   const showCompanies = result?.hasPlacements === true;
+ 
+-  // The rows on screen: filtered, then sorted. Copy and CSV export use this same order.
+-  const visibleRows = useMemo(() => {
+-    if (!result) return [];
++  const terms = useMemo(() => searchTerms(search), [search]);
++
++  // The rows on screen: filtered by status, then searched, then sorted. Copy and CSV export use this same list.
++  const { visibleRows, inView } = useMemo(() => {
++    if (!result) return { visibleRows: [] as LookupRow[], inView: 0 };
+     const filtered = result.rows.filter((r) => filter === "all" || r.status === filter);
+-    return sort ? sortRows(filtered, (r) => sortValue(r, sort.key), sort.dir) : filtered;
+-  }, [result, filter, sort]);
++    const searched =
++      terms.length > 0
++        ? filtered.filter((r) => rowMatches(searchCells(r, result.columns, result.hasPlacements), terms))
++        : filtered;
++    return {
++      visibleRows: sort ? sortRows(searched, (r) => sortValue(r, sort.key), sort.dir) : searched,
++      inView: filtered.length,
++    };
++  }, [result, filter, sort, terms]);
++
++  /** A cell lights up when it contains any of the searched words, so it's clear why the row matched. */
++  const hit = (text: string) => terms.length > 0 && terms.some((t) => cellHas(text, t));
+ 
+   function exportRows(): unknown[][] {
+     if (!result) return [];
+@@ -232,6 +260,37 @@ export default function LookupPage() {
+               <p className="empty">No Neo IDs in the pasted text.</p>
+             ) : (
+               <>
++                <div className="searchbar">
++                  <label htmlFor="result-search" className="sr-only">
++                    Search these results
++                  </label>
++                  <input
++                    id="result-search"
++                    type="search"
++                    value={search}
++                    autoComplete="off"
++                    spellCheck={false}
++                    placeholder="Search these results: name, number, company…"
++                    onChange={(e) => setSearch(e.target.value)}
++                    onKeyDown={(e) => {
++                      if (e.key === "Escape") setSearch("");
++                    }}
++                  />
++                  {search !== "" && (
++                    <button className="btn quiet" onClick={() => setSearch("")}>
++                      Clear
++                    </button>
++                  )}
++                </div>
++                {terms.length > 0 && (
++                  <p className="hint" role="status">
++                    {visibleRows.length === 0
++                      ? "No rows match."
++                      : `${visibleRows.length} of ${inView} ${inView === 1 ? "row matches" : "rows match"}.`}{" "}
++                    Every word has to match somewhere in the row.
++                  </p>
++                )}
++
+                 <div className="row" style={{ marginTop: 12 }}>
+                 <div className="filters" role="group" aria-label="Filter results">
+                   {(
+@@ -277,7 +336,7 @@ export default function LookupPage() {
+                     <tbody>
+                       {visibleRows.map((r, i) => (
+                         <tr key={`${r.neoId}-${i}`}>
+-                          <td>
++                          <td className={hit(r.neoId) ? "hit" : undefined}>
+                             <NeoIdText id={r.neoId} />
+                             {r.count > 1 && <span className="times">×{r.count}</span>}
+                           </td>
+@@ -288,7 +347,10 @@ export default function LookupPage() {
+                           </td>
+                           {r.status === "found" && result.columns.length > 0 ? (
+                             result.columns.map((c) => (
+-                              <td key={c.key} className={typeof r.data?.[c.key] === "number" ? "num" : undefined}>
++                              <td
++                                key={c.key}
++                                className={[typeof r.data?.[c.key] === "number" ? "num" : "", hit(formatCell(r.data?.[c.key])) ? "hit" : ""].filter(Boolean).join(" ") || undefined}
++                              >
+                                 {formatCell(r.data?.[c.key])}
+                               </td>
+                             ))
+@@ -300,7 +362,7 @@ export default function LookupPage() {
+                             </td>
+                           )}
+                           {showCompanies && (
+-                            <td>
++                            <td className={hit(r.companies.join(" ")) ? "hit" : undefined}>
+                               {r.companies.length > 0 ? (
+                                 <span className="companies">
+                                   {r.companies.map((name) => (
+@@ -319,7 +381,7 @@ export default function LookupPage() {
+                       {visibleRows.length === 0 && (
+                         <tr>
+                           <td className="note" colSpan={2 + Math.max(result.columns.length, 1) + (showCompanies ? 1 : 0)}>
+-                            Nothing in this view.
++                            {terms.length > 0 ? "No rows match your search." : "Nothing in this view."}
+                           </td>
+                         </tr>
+                       )}
+diff --git a/src/lib/find.ts b/src/lib/find.ts
+new file mode 100644
+index 0000000..06bd068
+--- /dev/null
++++ b/src/lib/find.ts
+@@ -0,0 +1,94 @@
++import type { Db } from "./db";
++import type { RecordData } from "./columns";
++import { HttpError } from "./students";
++import { MAX_SEARCH_LENGTH, searchTerms } from "./search";
++
++export const MAX_FIND_RESULTS = 100;
++
++export interface FindHit {
++  neoId: string;
++  /** False when the ID has placements but no student record. */
++  inStudents: boolean;
++  data: RecordData;
++  /** Alphabetical. */
++  companies: string[];
++}
++
++export interface FindResult {
++  /** The words that were searched for, folded to lower case. */
++  terms: string[];
++  hits: FindHit[];
++  /** How many students match in all, which can be more than `hits.length`. */
++  total: number;
++}
++
++/** Escapes LIKE wildcards so a typed "%" or "_" is searched for literally. */
++const likePattern = (term: string) => `%${term.replace(/[\\%_]/g, "\\$&")}%`;
++
++/**
++ * Finds students across every stored detail: Neo ID, each detail column's value,
++ * and company names. Column names are not searched (searching "name" must not
++ * match everyone just because a column is called "full_name").
++ *
++ * Same rules as the results table: every word must match somewhere in the row.
++ */
++export async function findStudents(db: Db, query: unknown): Promise<FindResult> {
++  if (typeof query !== "string") throw new HttpError(400, "Type something to search for.");
++  if (query.length > MAX_SEARCH_LENGTH) {
++    throw new HttpError(400, `Search for at most ${MAX_SEARCH_LENGTH} characters at a time.`);
++  }
++  const terms = searchTerms(query);
++  if (terms.length === 0) throw new HttpError(400, "Type something to search for.");
++
++  // One condition per word, each with its own parameter. Only parameter numbers are built into the SQL.
++  const conditions = terms.map(
++    (_, i) => `(
++      p.neo_id ilike $${i + 1} escape '\\'
++      or exists (select 1 from jsonb_each_text(s.data) e where e.value ilike $${i + 1} escape '\\')
++      or exists (
++        select 1 from placements pl join companies c on c.key = pl.company_key
++        where pl.neo_id = p.neo_id and c.name ilike $${i + 1} escape '\\'
++      )
++    )`,
++  );
++
++  const { rows } = await db.query<{
++    neo_id: string;
++    data: RecordData | null;
++    in_students: boolean;
++    companies: string[];
++    total: number;
++  }>(
++    `with people as (
++       select neo_id from students
++       union
++       select neo_id from placements
++     )
++     select p.neo_id,
++            s.data,
++            (s.neo_id is not null) as in_students,
++            coalesce(
++              (select array_agg(c.name order by lower(c.name), c.name)
++               from placements pl join companies c on c.key = pl.company_key
++               where pl.neo_id = p.neo_id),
++              '{}') as companies,
++            (count(*) over ())::int as total
++     from people p
++     left join students s on s.neo_id = p.neo_id
++     where ${conditions.join(" and ")}
++     order by p.neo_id
++     limit ${MAX_FIND_RESULTS}`,
++    terms.map(likePattern),
++  );
++
++  return {
++    terms,
++    total: rows[0]?.total ?? 0,
++    hits: rows.map((r) => ({
++      neoId: r.neo_id,
++      inStudents: r.in_students,
++      data: r.data ?? {},
++      companies: r.companies ?? [],
++    })),
++  };
++}
+diff --git a/src/lib/search.ts b/src/lib/search.ts
+new file mode 100644
+index 0000000..860eb1c
+--- /dev/null
++++ b/src/lib/search.ts
+@@ -0,0 +1,33 @@
++/**
++ * Free-text search, shared by the results table (in the browser) and the
++ * admin search (in the database, which follows the same rules).
++ *
++ * - The text is split into words. A row matches when EVERY word is found in
++ *   at least one of its columns, so "mehak vellore" narrows down, and each
++ *   word may match a different column.
++ * - Matching ignores capital letters and finds a word anywhere inside a cell
++ *   ("8.6" finds "8.64").
++ */
++
++export const MAX_SEARCH_TERMS = 8;
++export const MAX_SEARCH_LENGTH = 100;
++
++const fold = (s: string) => s.normalize("NFKC").toLowerCase();
++
++/** The distinct, folded words of a search, or [] when there's nothing to search for. */
++export function searchTerms(query: string): string[] {
++  const words = fold(query).split(/\s+/).filter(Boolean);
++  return [...new Set(words)].slice(0, MAX_SEARCH_TERMS);
++}
++
++/** True when `text` contains the folded `term`. */
++export function cellHas(text: string, term: string): boolean {
++  return fold(text).includes(term);
++}
++
++/** True when every term is found in at least one of the cells. No terms matches everything. */
++export function rowMatches(cells: readonly string[], terms: readonly string[]): boolean {
++  if (terms.length === 0) return true;
++  const folded = cells.map(fold);
++  return terms.every((t) => folded.some((c) => c.includes(t)));
++}
+diff --git a/tests/auth.test.ts b/tests/auth.test.ts
+index 850fee3..a54d221 100644
+--- a/tests/auth.test.ts
++++ b/tests/auth.test.ts
+@@ -109,6 +109,23 @@ describe("Admin routes", () => {
+     assert.deepEqual((await st.json()).companies, [{ name: "Google", count: 1 }]);
+   });
+ 
++  it("searching all students is admin-only", async () => {
++    const search = await import("../src/app/api/admin/search/route");
++    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: "asha" }))).status, 401);
++    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: "asha" }, `${SESSION_COOKIE}=1.deadbeef`))).status, 401);
++
++    const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }, undefined, "4.4.4.4"))).headers.get("set-cookie")!.split(";")[0];
++    const ok = await search.POST(jsonReq("/api/admin/search", { q: "asha" }, cookie));
++    assert.equal(ok.status, 200);
++    const body = await ok.json();
++    assert.deepEqual(body.terms, ["asha"]);
++    assert.ok(Array.isArray(body.hits) && typeof body.total === "number");
++
++    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: "   " }, cookie))).status, 400);
++    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: 7 }, cookie))).status, 400);
++    assert.equal((await search.POST(jsonReq("/api/admin/search", {}, cookie))).status, 400);
++  });
++
+   it("refuses non-JSON bodies and malformed upload bodies", async () => {
+     const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }))).headers.get("set-cookie")!.split(";")[0];
+     const form = new Request("http://localhost/api/admin/upload", { method: "POST", headers: { cookie, "content-type": "text/plain" }, body: "x" });
+diff --git a/tests/search.test.ts b/tests/search.test.ts
+new file mode 100644
+index 0000000..7c9b2ef
+--- /dev/null
++++ b/tests/search.test.ts
+@@ -0,0 +1,175 @@
++import assert from "node:assert/strict";
++import { before, describe, it } from "node:test";
++import { getReadyDb } from "../src/lib/db";
++import { MAX_FIND_RESULTS, findStudents } from "../src/lib/find";
++import { changePlacements } from "../src/lib/placements";
++import { MAX_SEARCH_TERMS, cellHas, rowMatches, searchTerms } from "../src/lib/search";
++import { applyUpload, validateUpload } from "../src/lib/students";
++import { freshDb } from "./helpers";
++
++describe("Search rules", () => {
++  it("splits into folded, distinct words and caps how many", () => {
++    assert.deepEqual(searchTerms("  Alpha   VELLORE\tALPHA "), ["alpha", "vellore"]);
++    assert.deepEqual(searchTerms("Ａｌｐｈａ"), ["alpha"], "full-width letters fold to plain ones");
++    assert.deepEqual(searchTerms("   "), []);
++    assert.deepEqual(searchTerms(""), []);
++    assert.equal(searchTerms("a b c d e f g h i j k").length, MAX_SEARCH_TERMS);
++  });
++
++  it("matches a word anywhere inside a cell, ignoring case", () => {
++    assert.ok(cellHas("Chennai", "enna"));
++    assert.ok(cellHas("99XYZ0001", "xyz00"));
++    assert.ok(cellHas("7.77", "7.7"));
++    assert.ok(!cellHas("Chennai", "vellore"));
++  });
++
++  it("needs every word to match, each in any column", () => {
++    const cells = ["A1B2C3D4", "Found", "Alpha Rivera", "Vellore", "Google"];
++    assert.ok(rowMatches(cells, ["alpha"]));
++    assert.ok(rowMatches(cells, ["alpha", "vellore", "google"]), "words may match different columns");
++    assert.ok(!rowMatches(cells, ["alpha", "chennai"]), "one missing word rules the row out");
++    assert.ok(rowMatches(cells, []), "nothing typed shows everything");
++    assert.ok(!rowMatches([], ["x"]));
++  });
++});
++
++const ID = (n: number) => {
++  const d = String(n).padStart(4, "0");
++  return `Q${d[0]}W${d[1]}E${d[2]}R${d[3]}`; // Q0W0E0R1 … : always letter-digit ×4
++};
++
++describe("Admin database search", () => {
++  let db: Awaited<ReturnType<typeof freshDb>>;
++  const people = [
++    { neoId: "A1B2C3D4", values: { registration_number: "99XYZ0001", full_name: "Alpha Rivera", campus: "Vellore", ug_mark: 7.77 } },
++    { neoId: "K1M3P5R7", values: { registration_number: "99XYZ0002", full_name: "Bravo Singh", campus: "Chennai", ug_mark: 6.66 } },
++    { neoId: "T2V4X6Z8", values: { registration_number: "99XYZ0003", full_name: "Zed_50%", campus: "Bhopal", ug_mark: 9 } },
++  ];
++  const columns = [
++    { key: "registration_number", label: "Registration Number" },
++    { key: "full_name", label: "Full Name" },
++    { key: "campus", label: "Campus" },
++    { key: "ug_mark", label: "UG Mark" },
++  ];
++  const ids = async (q: string) => (await findStudents(db, q)).hits.map((h) => h.neoId);
++
++  before(async () => {
++    await freshDb();
++    db = await getReadyDb();
++    await applyUpload(db, validateUpload({ rows: people, columns, overwrite: false, dryRun: false }));
++    await changePlacements(db, { action: "add", company: "Google", text: "A1B2C3D4 K1M3P5R7" });
++    await changePlacements(db, { action: "add", company: "Adobe", text: "A1B2C3D4 E9G7J5L3" }); // E9G7J5L3 has no student record
++  });
++
++  it("finds by name, ignoring case and matching part of a word", async () => {
++    assert.deepEqual(await ids("alpha"), ["A1B2C3D4"]);
++    assert.deepEqual(await ids("RAVO"), ["K1M3P5R7"]);
++  });
++
++  it("finds by Neo ID, even a lower-case fragment", async () => {
++    assert.deepEqual(await ids("k1m3"), ["K1M3P5R7"]);
++    assert.deepEqual(await ids("t2v4x6z8"), ["T2V4X6Z8"]);
++  });
++
++  it("finds by any detail column, including numbers", async () => {
++    assert.deepEqual(await ids("xyz0002"), ["K1M3P5R7"]);
++    assert.deepEqual(await ids("vellore"), ["A1B2C3D4"]);
++    assert.deepEqual(await ids("6.6"), ["K1M3P5R7"]);
++  });
++
++  it("finds by company, and reports every company alphabetically", async () => {
++    const r = await findStudents(db, "google");
++    assert.deepEqual(r.hits.map((h) => h.neoId), ["A1B2C3D4", "K1M3P5R7"]);
++    assert.deepEqual(r.hits[0].companies, ["Adobe", "Google"]);
++    assert.deepEqual(r.hits[1].companies, ["Google"]);
++  });
++
++  it("finds someone who has placements but no student record", async () => {
++    const r = await findStudents(db, "adobe");
++    assert.deepEqual(r.hits.map((h) => [h.neoId, h.inStudents]), [["A1B2C3D4", true], ["E9G7J5L3", false]]);
++    assert.deepEqual(r.hits[1].data, {});
++    assert.deepEqual((await findStudents(db, "e9g7")).hits.map((h) => h.neoId), ["E9G7J5L3"]);
++  });
++
++  it("needs every word to match, each in any column", async () => {
++    assert.deepEqual(await ids("alpha google"), ["A1B2C3D4"]);
++    assert.deepEqual(await ids("vellore adobe"), ["A1B2C3D4"]);
++    assert.deepEqual(await ids("chennai adobe"), [], "Bravo is in Google, not Adobe");
++    assert.deepEqual(await ids("google chennai 6.66"), ["K1M3P5R7"]);
++  });
++
++  it("doesn't match column names, only the values in them", async () => {
++    assert.deepEqual(await ids("full_name"), []);
++    assert.deepEqual(await ids("registration"), []);
++    assert.deepEqual(await ids("ug_mark"), []);
++  });
++
++  it("treats % and _ as ordinary characters", async () => {
++    assert.deepEqual(await ids("%"), ["T2V4X6Z8"], "only the value containing a percent sign");
++    assert.deepEqual(await ids("_"), ["T2V4X6Z8"]);
++    assert.deepEqual(await ids("50%"), ["T2V4X6Z8"]);
++    assert.deepEqual(await ids("zed_"), ["T2V4X6Z8"]);
++    assert.deepEqual(await ids("z_d"), [], "_ is not a wildcard for 'e'");
++    assert.deepEqual(await ids("\\"), []);
++  });
++
++  it("is safe against SQL tricks", async () => {
++    const r = await findStudents(db, `'; drop table students; -- ") or 1=1`);
++    assert.equal(r.total, 0);
++    assert.deepEqual(await ids("alpha"), ["A1B2C3D4"], "tables are intact");
++  });
++
++  it("matches full-width letters the way the browser does", async () => {
++    assert.deepEqual(await ids("ａｌｐｈａ"), ["A1B2C3D4"]);
++  });
++
++  it("returns the first 100 matches in Neo ID order, and the real total", async () => {
++    const bulk = Array.from({ length: 130 }, (_, i) => ({ neoId: ID(i + 1), values: { campus: "Bulk" } }));
++    for (let i = 0; i < bulk.length; i += 65) {
++      await applyUpload(db, validateUpload({ rows: bulk.slice(i, i + 65), columns, overwrite: false, dryRun: false }));
++    }
++    const r = await findStudents(db, "bulk");
++    assert.equal(r.total, 130);
++    assert.equal(r.hits.length, MAX_FIND_RESULTS);
++    const sorted = [...r.hits.map((h) => h.neoId)].sort();
++    assert.deepEqual(r.hits.map((h) => h.neoId), sorted);
++    assert.equal(r.hits[0].neoId, ID(1));
++  });
++
++  it("rejects empty, non-text and over-long searches", async () => {
++    for (const bad of ["", "   ", "\n\t", null, undefined, 5, {}]) await assert.rejects(findStudents(db, bad), { status: 400 });
++    await assert.rejects(findStudents(db, "x".repeat(101)), { status: 400 });
++    assert.equal((await findStudents(db, "x".repeat(100))).total, 0);
++  });
++
++  it("ignores words beyond the eighth", async () => {
++    // Repeated words count once, then only the first eight distinct words are used.
++    const r = await findStudents(db, "alpha vellore 7.77 99xyz0001 a1b2 google adobe alpha rivera zzzzzz");
++    assert.equal(r.terms.length, 8);
++    assert.deepEqual(r.terms.slice(-1), ["rivera"]);
++    assert.equal(r.total, 1, "the ninth distinct word 'zzzzzz' was ignored");
++  });
++
++  it("gives the same answers as the results-table search for the same queries", async () => {
++    // Rebuild each person's cells the way the table shows them, then compare with the database.
++    const everyone = await findStudents(db, "a");
++    const all = (await db.query<{ neo_id: string }>("select neo_id from (select neo_id from students union select neo_id from placements) x order by 1")).rows;
++    assert.ok(all.length > everyone.hits.length || all.length > 0);
++    const people = new Map<string, string[]>();
++    for (const { neo_id } of all) {
++      const hit = (await findStudents(db, neo_id.toLowerCase())).hits.find((h) => h.neoId === neo_id)!;
++      people.set(neo_id, [hit.neoId, ...Object.values(hit.data).map(String), ...hit.companies]);
++    }
++    for (const q of ["alpha", "google", "alpha google", "vellore adobe", "chennai adobe", "6.6", "50%", "z_d", "ａｌｐｈａ", "bulk", "q0w0", "e9g7 adobe", "campus"]) {
++      const inBrowser = [...people].filter(([, cells]) => rowMatches(cells, searchTerms(q))).map(([id]) => id).sort();
++      const inDb = (await findStudents(db, q)).hits.map((h) => h.neoId);
++      const inDbAll = q === "bulk" ? inDb : inDb; // bulk exceeds the 100-row cap; compared separately below
++      if (q === "bulk") {
++        assert.equal(inBrowser.length, 130);
++        assert.deepEqual(inBrowser.slice(0, MAX_FIND_RESULTS), inDbAll);
++      } else {
++        assert.deepEqual(inDbAll, inBrowser, `query: ${q}`);
++      }
++    }
++  });
++});

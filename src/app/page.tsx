@@ -4,6 +4,7 @@ import { useMemo, useRef, useState } from "react";
 import { NeoIdText } from "@/components/NeoIdText";
 import { api, downloadText, formatCell, toCsv, toTsv } from "@/lib/client";
 import { classifyTokens, tokenize } from "@/lib/neo";
+import { cellHas, rowMatches, searchTerms } from "@/lib/search";
 import { nextSort, sortRows, type SortState, type SortValue } from "@/lib/sort";
 import type { LookupResult, LookupRow, LookupStatus } from "@/lib/students";
 
@@ -27,6 +28,18 @@ function sortValue(r: LookupRow, key: string): SortValue {
   if (key === SORT_COMPANIES) return r.companies.join(", ");
   const v = r.data?.[key];
   return typeof v === "boolean" ? formatCell(v) : v;
+}
+
+/**
+ * The text of each searchable column in a row: Neo ID, the detail columns, then Companies.
+ * Status isn't searched ("found" is inside "Not found"); the Found / Not found buttons filter by it.
+ */
+function searchCells(r: LookupRow, columns: { key: string }[], showCompanies: boolean): string[] {
+  return [
+    r.neoId,
+    ...columns.map((c) => (r.data ? formatCell(r.data[c.key]) : "")),
+    ...(showCompanies ? [r.companies.join(" ")] : []),
+  ];
 }
 
 function SortHeader({
@@ -61,6 +74,7 @@ export default function LookupPage() {
   const [filter, setFilter] = useState<Filter>("all");
   const [copied, setCopied] = useState(false);
   const [sort, setSort] = useState<SortState | null>(null);
+  const [search, setSearch] = useState("");
   const resultsRef = useRef<HTMLDivElement>(null);
 
   // Words that aren't Neo IDs (times, dates, labels...) are dropped; they're only counted.
@@ -83,6 +97,7 @@ export default function LookupPage() {
       setResult(data);
       setFilter("all");
       setSort(null);
+      setSearch("");
       requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
     } catch (err) {
       setError(err instanceof Error ? err.message : "The lookup failed.");
@@ -95,17 +110,30 @@ export default function LookupPage() {
     setText("");
     setResult(null);
     setSort(null);
+    setSearch("");
     setError(null);
   }
 
   const showCompanies = result?.hasPlacements === true;
 
-  // The rows on screen: filtered, then sorted. Copy and CSV export use this same order.
-  const visibleRows = useMemo(() => {
-    if (!result) return [];
+  const terms = useMemo(() => searchTerms(search), [search]);
+
+  // The rows on screen: filtered by status, then searched, then sorted. Copy and CSV export use this same list.
+  const { visibleRows, inView } = useMemo(() => {
+    if (!result) return { visibleRows: [] as LookupRow[], inView: 0 };
     const filtered = result.rows.filter((r) => filter === "all" || r.status === filter);
-    return sort ? sortRows(filtered, (r) => sortValue(r, sort.key), sort.dir) : filtered;
-  }, [result, filter, sort]);
+    const searched =
+      terms.length > 0
+        ? filtered.filter((r) => rowMatches(searchCells(r, result.columns, result.hasPlacements), terms))
+        : filtered;
+    return {
+      visibleRows: sort ? sortRows(searched, (r) => sortValue(r, sort.key), sort.dir) : searched,
+      inView: filtered.length,
+    };
+  }, [result, filter, sort, terms]);
+
+  /** A cell lights up when it contains any of the searched words, so it's clear why the row matched. */
+  const hit = (text: string) => terms.length > 0 && terms.some((t) => cellHas(text, t));
 
   function exportRows(): unknown[][] {
     if (!result) return [];
@@ -232,6 +260,37 @@ export default function LookupPage() {
               <p className="empty">No Neo IDs in the pasted text.</p>
             ) : (
               <>
+                <div className="searchbar">
+                  <label htmlFor="result-search" className="sr-only">
+                    Search these results
+                  </label>
+                  <input
+                    id="result-search"
+                    type="search"
+                    value={search}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="Search these results: name, number, company…"
+                    onChange={(e) => setSearch(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setSearch("");
+                    }}
+                  />
+                  {search !== "" && (
+                    <button className="btn quiet" onClick={() => setSearch("")}>
+                      Clear
+                    </button>
+                  )}
+                </div>
+                {terms.length > 0 && (
+                  <p className="hint" role="status">
+                    {visibleRows.length === 0
+                      ? "No rows match."
+                      : `${visibleRows.length} of ${inView} ${inView === 1 ? "row matches" : "rows match"}.`}{" "}
+                    Every word has to match somewhere in the row.
+                  </p>
+                )}
+
                 <div className="row" style={{ marginTop: 12 }}>
                 <div className="filters" role="group" aria-label="Filter results">
                   {(
@@ -277,7 +336,7 @@ export default function LookupPage() {
                     <tbody>
                       {visibleRows.map((r, i) => (
                         <tr key={`${r.neoId}-${i}`}>
-                          <td>
+                          <td className={hit(r.neoId) ? "hit" : undefined}>
                             <NeoIdText id={r.neoId} />
                             {r.count > 1 && <span className="times">×{r.count}</span>}
                           </td>
@@ -288,7 +347,10 @@ export default function LookupPage() {
                           </td>
                           {r.status === "found" && result.columns.length > 0 ? (
                             result.columns.map((c) => (
-                              <td key={c.key} className={typeof r.data?.[c.key] === "number" ? "num" : undefined}>
+                              <td
+                                key={c.key}
+                                className={[typeof r.data?.[c.key] === "number" ? "num" : "", hit(formatCell(r.data?.[c.key])) ? "hit" : ""].filter(Boolean).join(" ") || undefined}
+                              >
                                 {formatCell(r.data?.[c.key])}
                               </td>
                             ))
@@ -300,7 +362,7 @@ export default function LookupPage() {
                             </td>
                           )}
                           {showCompanies && (
-                            <td>
+                            <td className={hit(r.companies.join(" ")) ? "hit" : undefined}>
                               {r.companies.length > 0 ? (
                                 <span className="companies">
                                   {r.companies.map((name) => (
@@ -319,7 +381,7 @@ export default function LookupPage() {
                       {visibleRows.length === 0 && (
                         <tr>
                           <td className="note" colSpan={2 + Math.max(result.columns.length, 1) + (showCompanies ? 1 : 0)}>
-                            Nothing in this view.
+                            {terms.length > 0 ? "No rows match your search." : "Nothing in this view."}
                           </td>
                         </tr>
                       )}

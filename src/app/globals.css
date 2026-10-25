@@ -73,7 +73,7 @@ nav a:hover { color: var(--ink); text-decoration: underline; }
 
 /* ---------- form controls ---------- */
 label { font-weight: 600; display: block; margin-bottom: 6px; }
-textarea, input[type="password"], input[type="text"], select {
+textarea, input[type="password"], input[type="text"], input[type="search"], select {
   width: 100%;
   font: inherit;
   color: var(--ink);
@@ -162,6 +162,10 @@ th[aria-sort] { padding: 0; }
 th[aria-sort="ascending"] .sort-mark, th[aria-sort="descending"] .sort-mark { color: var(--accent); }
 .companies { display: flex; flex-wrap: wrap; gap: 4px; }
 .none { color: var(--muted); }
+.searchbar { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+.searchbar input { flex: 1; min-width: 0; }
+input[type="search"]::-webkit-search-cancel-button { display: none; }
+td.hit { background: var(--accent-soft); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 td.note { color: var(--muted); }
 .badge {

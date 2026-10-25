@@ -56,6 +56,12 @@ On the admin page, type a company name, paste the Neo IDs of the students placed
 - **Undo.** **Remove from company** takes the pasted students out of that company. A company with nobody left disappears. The table of companies has a **Delete** button that removes a company and all its placements.
 - Placements are public on the lookup page like the rest of a student's details.
 
+## Searching
+
+- **On the lookup page**, the *Search these results* box narrows the table you're looking at. A row stays when every word you typed is found somewhere in it: Neo ID, any detail column, or Companies. Matching ignores capital letters and works on part of a word, so `chen 9.1` finds a student whose name contains "chen" and who has a 9.1 anywhere. Matching cells are highlighted. It combines with the Found / Not found buttons and with sorting, starts fresh on each new lookup, and Copy table and Download CSV follow what's on screen.
+- **On the admin page**, *Find students* searches everything stored, not just one lookup: every Neo ID, every detail column and company names. The same rules apply (all words must match, part of a word is enough). Students who only have placements are included. At most 100 matches are shown, with the true total, so add a word to narrow a large result. Column headings aren't searched, only the values.
+- The admin search is **admin-only on purpose**: the lookup page needs you to already know an ID, while this search could list students by any detail.
+
 ## Who can see what
 
 - **Uploads and the admin page** need the admin password. The password is checked on the server, the session is a signed `HttpOnly` cookie that lasts 8 hours, and five wrong passwords lock an IP out for 15 minutes.
@@ -95,6 +101,8 @@ Next.js (App Router) and TypeScript. Each student is one row: the Neo ID plus a 
 | `src/lib/students.ts` | Lookup, upload validation, preview and save |
 | `src/lib/placements.ts` | Company names, adding and removing placements |
 | `src/lib/sort.ts` | Column sorting for the results table |
+| `src/lib/search.ts` | Search rules shared by the lookup page and the admin search |
+| `src/lib/find.ts` | The admin search over all stored data |
 | `src/lib/auth.ts` | Password check, session cookie, login throttle |
 | `src/lib/db.ts` | Database access through Neon's serverless driver (one short-lived connection per operation) |
 | `src/lib/env.ts` | Reads settings from `process.env` or, on Workers, from Cloudflare bindings |

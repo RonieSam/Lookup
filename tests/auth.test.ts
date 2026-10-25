@@ -109,6 +109,23 @@ describe("Admin routes", () => {
     assert.deepEqual((await st.json()).companies, [{ name: "Google", count: 1 }]);
   });
 
+  it("searching all students is admin-only", async () => {
+    const search = await import("../src/app/api/admin/search/route");
+    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: "asha" }))).status, 401);
+    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: "asha" }, `${SESSION_COOKIE}=1.deadbeef`))).status, 401);
+
+    const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }, undefined, "4.4.4.4"))).headers.get("set-cookie")!.split(";")[0];
+    const ok = await search.POST(jsonReq("/api/admin/search", { q: "asha" }, cookie));
+    assert.equal(ok.status, 200);
+    const body = await ok.json();
+    assert.deepEqual(body.terms, ["asha"]);
+    assert.ok(Array.isArray(body.hits) && typeof body.total === "number");
+
+    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: "   " }, cookie))).status, 400);
+    assert.equal((await search.POST(jsonReq("/api/admin/search", { q: 7 }, cookie))).status, 400);
+    assert.equal((await search.POST(jsonReq("/api/admin/search", {}, cookie))).status, 400);
+  });
+
   it("refuses non-JSON bodies and malformed upload bodies", async () => {
     const cookie = (await login.POST(jsonReq("/api/admin/login", { password: "correct horse battery" }))).headers.get("set-cookie")!.split(";")[0];
     const form = new Request("http://localhost/api/admin/upload", { method: "POST", headers: { cookie, "content-type": "text/plain" }, body: "x" });

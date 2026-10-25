@@ -4,8 +4,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { NeoIdText } from "@/components/NeoIdText";
 import { ApiError, api } from "@/lib/client";
 import { buildMapping, detectNeoColumn, parseRows, type MappedColumn } from "@/lib/columns";
+import type { FindResult } from "@/lib/find";
 import { classifyTokens, tokenize } from "@/lib/neo";
 import type { PlacementResult } from "@/lib/placements";
+import { cellHas } from "@/lib/search";
 import type { CompanySummary, UploadStats } from "@/lib/students";
 
 interface Summary {
@@ -158,9 +160,142 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () => 
         )}
       </section>
 
+      <FindStudents summary={summary} onChanged={onChanged} />
       <Uploader summary={summary} onChanged={onChanged} />
       <Placements summary={summary} onChanged={onChanged} />
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+
+function FindStudents({ summary, onChanged }: { summary: Summary; onChanged: () => Promise<void> }) {
+  const [q, setQ] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [found, setFound] = useState<{ result: FindResult; query: string } | null>(null);
+
+  async function run(e: React.FormEvent) {
+    e.preventDefault();
+    if (busy || q.trim() === "") return;
+    setBusy(true);
+    setError(null);
+    try {
+      setFound({ result: await api<FindResult>("/api/admin/search", { json: { q } }), query: q.trim() });
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        await onChanged(); // session expired: back to the sign-in form
+        return;
+      }
+      setError(err instanceof Error ? err.message : "The search failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const terms = found?.result.terms ?? [];
+  const hit = (text: string) => terms.some((t) => cellHas(text, t));
+
+  return (
+    <section className="card" aria-labelledby="find-title">
+      <h2 id="find-title">Find students</h2>
+      <form onSubmit={run}>
+        <label htmlFor="find-q">Search everything stored</label>
+        <div className="searchbar">
+          <input
+            id="find-q"
+            type="search"
+            value={q}
+            autoComplete="off"
+            spellCheck={false}
+            maxLength={100}
+            placeholder="Name, registration number, Neo ID, campus, company…"
+            onChange={(e) => setQ(e.target.value)}
+          />
+          <button className="btn primary" disabled={busy || q.trim() === ""}>
+            {busy ? "Searching…" : "Search"}
+          </button>
+        </div>
+        <p className="hint">
+          Looks in the Neo ID, every detail column and company names. Capital letters don't matter, and part of a word is
+          enough. With several words, each one has to match somewhere in the student's details.
+        </p>
+      </form>
+
+      {error && (
+        <div className="notice bad" role="alert">
+          {error}
+        </div>
+      )}
+
+      {found && (
+        <div role="status">
+          {found.result.total === 0 ? (
+            <p className="empty">Nothing matches “{found.query}”.</p>
+          ) : (
+            <>
+              <p className="hint">
+                {found.result.total > found.result.hits.length
+                  ? `Showing the first ${fmt(found.result.hits.length)} of ${fmt(found.result.total)} matches. Add a word to narrow it down.`
+                  : `${fmt(found.result.total)} ${found.result.total === 1 ? "match" : "matches"}.`}
+              </p>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Neo ID</th>
+                      {summary.columns.map((c) => (
+                        <th key={c.key} scope="col">
+                          {c.label}
+                        </th>
+                      ))}
+                      <th scope="col">Companies</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {found.result.hits.map((h) => (
+                      <tr key={h.neoId}>
+                        <td className={hit(h.neoId) ? "hit" : undefined}>
+                          <NeoIdText id={h.neoId} />
+                        </td>
+                        {h.inStudents ? (
+                          summary.columns.map((c) => {
+                            const v = h.data[c.key];
+                            const text = v === undefined ? "" : String(v);
+                            return (
+                              <td key={c.key} className={[typeof v === "number" ? "num" : "", hit(text) ? "hit" : ""].filter(Boolean).join(" ") || undefined}>
+                                {text}
+                              </td>
+                            );
+                          })
+                        ) : (
+                          <td className="note" colSpan={Math.max(summary.columns.length, 1)}>
+                            No student record yet (only placements are saved for this Neo ID).
+                          </td>
+                        )}
+                        <td className={hit(h.companies.join(" ")) ? "hit" : undefined}>
+                          {h.companies.length > 0 ? (
+                            <span className="companies">
+                              {h.companies.map((name) => (
+                                <span key={name} className="badge info">
+                                  {name}
+                                </span>
+                              ))}
+                            </span>
+                          ) : (
+                            <span className="none">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
