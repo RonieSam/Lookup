@@ -128,6 +128,23 @@ async function ensureSchema(db: Db): Promise<void> {
         primary key (neo_id, company_key)
       )`);
     await tx.query("create index if not exists placements_company_idx on placements (company_key)");
+    // Mail sync: one row remembering how far the last sync got, and one row per mail already handled.
+    await tx.query(`
+      create table if not exists mail_sync (
+        id          integer primary key check (id = 1),
+        cursor      timestamptz not null,
+        last_run_at timestamptz not null default now()
+      )`);
+    await tx.query(`
+      create table if not exists synced_mails (
+        message_id    text primary key,
+        subject       text not null,
+        mail_date     timestamptz not null,
+        company       text,
+        student_count integer not null default 0,
+        status        text not null check (status in ('saved', 'skipped')),
+        synced_at     timestamptz not null default now()
+      )`);
     await tx.query(`
       create table if not exists login_throttle (
         ip           text primary key,

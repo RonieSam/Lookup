@@ -56,6 +56,26 @@ On the admin page, type a company name, paste the Neo IDs of the students placed
 - **Undo.** **Remove from company** takes the pasted students out of that company. A company with nobody left disappears. The table of companies has a **Delete** button that removes a company and all its placements.
 - Placements are public on the lookup page like the rest of a student's details.
 
+## Syncing placements from Gmail
+
+On the admin page, **Sync placements from Gmail** reads your selection-list mails and fills in placements for you. It only reads mail (the `gmail.readonly` permission) and never sends, deletes or changes anything.
+
+- **How a mail is read.** The company comes from the subject: the text between "Congratulations" and the drive type, so "Congratulations !! Myntra Super Dream Internship Selection list - 2027 Batch !!" gives **Myntra**. Neo IDs come from the body; only whole words that are valid Neo IDs count. If a subject doesn't fit, the company box is left empty for you to type.
+- **Nothing is saved by surprise.** **Check mail** shows each new mail with its company and how many IDs it has. Fix a name or clear it to skip a mail, then click **Save**. Placements use the same rules as the Placements box (a student can be in many companies, repeats are harmless).
+- **Only new mail is read.** The app remembers the date it has checked up to and every mail it has handled. The first sync asks for a start date; after that, leave the date empty and it continues from where it stopped (it looks back two days to catch mail Gmail was slow to index, and skips mails already handled). Pick an earlier date to look further back.
+- **25 mails per check.** This keeps one click inside Cloudflare's free-plan limit on outside requests. If more are waiting it says so; save, then check again.
+- The search is `subject:"selection list"`. To narrow it (for example to one sender), set `MAIL_SYNC_QUERY`, such as `subject:"selection list" from:placements@example.edu`.
+
+### One-time Google setup
+
+1. In [Google Cloud Console](https://console.cloud.google.com) create a project and enable the **Gmail API**.
+2. *APIs & Services → OAuth consent screen*: choose External, fill in the basics, add the `https://www.googleapis.com/auth/gmail.readonly` scope, and add your Gmail address as a test user. Then click **Publish app**. While an app stays in *Testing*, Google expires its login after 7 days.
+3. *Credentials → Create credentials → OAuth client ID → Web application*, with `https://developers.google.com/oauthplayground` as an authorized redirect URI. Copy the client ID and secret.
+4. Open the [OAuth Playground](https://developers.google.com/oauthplayground), click the gear, tick **Use your own OAuth credentials** and paste the two values. Authorize `https://www.googleapis.com/auth/gmail.readonly` with your account (click through the "unverified app" warning), then **Exchange authorization code for tokens** and copy the **refresh token**.
+5. Add three settings alongside the others and redeploy: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`.
+
+If Google later rejects the login, the page says so; repeat step 4 and replace `GOOGLE_REFRESH_TOKEN`.
+
 ## Searching
 
 - **On the lookup page**, the *Search these results* box narrows the table you're looking at. A row stays when every word you typed is found somewhere in it: Neo ID, any detail column, or Companies. Matching ignores capital letters and works on part of a word, so `chen 9.1` finds a student whose name contains "chen" and who has a 9.1 anywhere. Matching cells are highlighted. It combines with the Found / Not found buttons and with sorting, starts fresh on each new lookup, and Copy table and Download CSV follow what's on screen.
@@ -100,6 +120,7 @@ Next.js (App Router) and TypeScript. Each student is one row: the Neo ID plus a 
 | `src/lib/merge.ts` | How an uploaded record merges into a stored one |
 | `src/lib/students.ts` | Lookup, upload validation, preview and save |
 | `src/lib/placements.ts` | Company names, adding and removing placements |
+| `src/lib/gmail.ts`, `mailParse.ts`, `mailSync.ts` | Reading selection-list mails and turning them into placements |
 | `src/lib/sort.ts` | Column sorting for the results table |
 | `src/lib/search.ts` | Search rules shared by the lookup page and the admin search |
 | `src/lib/find.ts` | The admin search over all stored data |

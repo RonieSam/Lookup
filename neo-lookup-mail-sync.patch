@@ -1,0 +1,1322 @@
+diff --git a/.env.example b/.env.example
+index 77dcdc4..323aa4e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -7,3 +7,9 @@ ADMIN_PASSWORD=choose-a-long-password
+ # Random string used to sign the admin session cookie (16+ characters).
+ # Generate one with:  openssl rand -hex 32
+ SESSION_SECRET=
++
++# Optional: sync placements from Gmail (see the README, "Syncing placements from Gmail")
++GOOGLE_CLIENT_ID=
++GOOGLE_CLIENT_SECRET=
++GOOGLE_REFRESH_TOKEN=
++# MAIL_SYNC_QUERY=subject:"selection list"
+diff --git a/README.md b/README.md
+index d730624..e159588 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,26 @@ On the admin page, type a company name, paste the Neo IDs of the students placed
+ - **Undo.** **Remove from company** takes the pasted students out of that company. A company with nobody left disappears. The table of companies has a **Delete** button that removes a company and all its placements.
+ - Placements are public on the lookup page like the rest of a student's details.
+ 
++## Syncing placements from Gmail
++
++On the admin page, **Sync placements from Gmail** reads your selection-list mails and fills in placements for you. It only reads mail (the `gmail.readonly` permission) and never sends, deletes or changes anything.
++
++- **How a mail is read.** The company comes from the subject: the text between "Congratulations" and the drive type, so "Congratulations !! Myntra Super Dream Internship Selection list - 2027 Batch !!" gives **Myntra**. Neo IDs come from the body; only whole words that are valid Neo IDs count. If a subject doesn't fit, the company box is left empty for you to type.
++- **Nothing is saved by surprise.** **Check mail** shows each new mail with its company and how many IDs it has. Fix a name or clear it to skip a mail, then click **Save**. Placements use the same rules as the Placements box (a student can be in many companies, repeats are harmless).
++- **Only new mail is read.** The app remembers the date it has checked up to and every mail it has handled. The first sync asks for a start date; after that, leave the date empty and it continues from where it stopped (it looks back two days to catch mail Gmail was slow to index, and skips mails already handled). Pick an earlier date to look further back.
++- **25 mails per check.** This keeps one click inside Cloudflare's free-plan limit on outside requests. If more are waiting it says so; save, then check again.
++- The search is `subject:"selection list"`. To narrow it (for example to one sender), set `MAIL_SYNC_QUERY`, such as `subject:"selection list" from:placements@example.edu`.
++
++### One-time Google setup
++
++1. In [Google Cloud Console](https://console.cloud.google.com) create a project and enable the **Gmail API**.
++2. *APIs & Services → OAuth consent screen*: choose External, fill in the basics, add the `https://www.googleapis.com/auth/gmail.readonly` scope, and add your Gmail address as a test user. Then click **Publish app**. While an app stays in *Testing*, Google expires its login after 7 days.
++3. *Credentials → Create credentials → OAuth client ID → Web application*, with `https://developers.google.com/oauthplayground` as an authorized redirect URI. Copy the client ID and secret.
++4. Open the [OAuth Playground](https://developers.google.com/oauthplayground), click the gear, tick **Use your own OAuth credentials** and paste the two values. Authorize `https://www.googleapis.com/auth/gmail.readonly` with your account (click through the "unverified app" warning), then **Exchange authorization code for tokens** and copy the **refresh token**.
++5. Add three settings alongside the others and redeploy: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`.
++
++If Google later rejects the login, the page says so; repeat step 4 and replace `GOOGLE_REFRESH_TOKEN`.
++
+ ## Searching
+ 
+ - **On the lookup page**, the *Search these results* box narrows the table you're looking at. A row stays when every word you typed is found somewhere in it: Neo ID, any detail column, or Companies. Matching ignores capital letters and works on part of a word, so `chen 9.1` finds a student whose name contains "chen" and who has a 9.1 anywhere. Matching cells are highlighted. It combines with the Found / Not found buttons and with sorting, starts fresh on each new lookup, and Copy table and Download CSV follow what's on screen.
+@@ -100,6 +120,7 @@ Next.js (App Router) and TypeScript. Each student is one row: the Neo ID plus a
+ | `src/lib/merge.ts` | How an uploaded record merges into a stored one |
+ | `src/lib/students.ts` | Lookup, upload validation, preview and save |
+ | `src/lib/placements.ts` | Company names, adding and removing placements |
++| `src/lib/gmail.ts`, `mailParse.ts`, `mailSync.ts` | Reading selection-list mails and turning them into placements |
+ | `src/lib/sort.ts` | Column sorting for the results table |
+ | `src/lib/search.ts` | Search rules shared by the lookup page and the admin search |
+ | `src/lib/find.ts` | The admin search over all stored data |
+diff --git a/src/app/admin/page.tsx b/src/app/admin/page.tsx
+index a2453c7..44e2fcc 100644
+--- a/src/app/admin/page.tsx
++++ b/src/app/admin/page.tsx
+@@ -5,6 +5,7 @@ import { NeoIdText } from "@/components/NeoIdText";
+ import { ApiError, api } from "@/lib/client";
+ import { buildMapping, detectNeoColumn, parseRows, type MappedColumn } from "@/lib/columns";
+ import type { FindResult } from "@/lib/find";
++import type { MailSyncStatus, SaveResult, SyncPreview } from "@/lib/mailSync";
+ import { classifyTokens, tokenize } from "@/lib/neo";
+ import type { PlacementResult } from "@/lib/placements";
+ import { cellHas } from "@/lib/search";
+@@ -162,6 +163,7 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () =>
+ 
+       <FindStudents summary={summary} onChanged={onChanged} />
+       <Uploader summary={summary} onChanged={onChanged} />
++      <MailSync onChanged={onChanged} />
+       <Placements summary={summary} onChanged={onChanged} />
+     </div>
+   );
+@@ -301,6 +303,209 @@ function FindStudents({ summary, onChanged }: { summary: Summary; onChanged: ()
+ 
+ /* ------------------------------------------------------------------ */
+ 
++function MailSync({ onChanged }: { onChanged: () => Promise<void> }) {
++  const [status, setStatus] = useState<MailSyncStatus | null>(null);
++  const [since, setSince] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [preview, setPreview] = useState<SyncPreview | null>(null);
++  // The company to save each mail under; blank means skip that mail.
++  const [companies, setCompanies] = useState<Record<string, string>>({});
++  const [saved, setSaved] = useState<SaveResult | null>(null);
++
++  const loadStatus = useCallback(async () => {
++    try {
++      setStatus(await api<MailSyncStatus>("/api/admin/mail"));
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Couldn't read the mail sync status.");
++    }
++  }, []);
++  useEffect(() => {
++    void loadStatus();
++  }, [loadStatus]);
++
++  const when = (iso: string) => new Date(iso).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
++
++  async function check() {
++    setBusy(true);
++    setError(null);
++    setSaved(null);
++    try {
++      const p = await api<SyncPreview>("/api/admin/mail/sync", { json: { since: since || undefined } });
++      setPreview(p);
++      setCompanies(Object.fromEntries(p.mails.map((m) => [m.id, m.company ?? ""])));
++    } catch (err) {
++      if (err instanceof ApiError && err.status === 401) {
++        await onChanged();
++        return;
++      }
++      setError(err instanceof Error ? err.message : "Couldn't check the mail.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const willSave = preview?.mails.filter((m) => (companies[m.id] ?? "").trim() !== "" && m.ids.length > 0) ?? [];
++
++  async function save() {
++    if (!preview) return;
++    setBusy(true);
++    setError(null);
++    try {
++      const result = await api<SaveResult>("/api/admin/mail/save", {
++        json: {
++          mails: preview.mails.map((m) => ({
++            id: m.id,
++            subject: m.subject,
++            date: m.date,
++            company: (companies[m.id] ?? "").trim() || null,
++            ids: m.ids,
++          })),
++        },
++      });
++      setSaved(result);
++      setPreview(null);
++      setSince("");
++      await Promise.all([loadStatus(), onChanged()]);
++    } catch (err) {
++      if (err instanceof ApiError && err.status === 401) {
++        await onChanged();
++        return;
++      }
++      setError(err instanceof Error ? err.message : "Couldn't save.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <section className="card" aria-labelledby="mail-title">
++      <h2 id="mail-title">Sync placements from Gmail</h2>
++      {status && !status.configured ? (
++        <div className="notice warn">
++          Not set up yet. Add <code>GOOGLE_CLIENT_ID</code>, <code>GOOGLE_CLIENT_SECRET</code> and{" "}
++          <code>GOOGLE_REFRESH_TOKEN</code> as settings, then redeploy. The README has the steps.
++        </div>
++      ) : (
++        <>
++          <p className="hint">
++            Reads mails matching <code>{status?.query ?? "…"}</code>, takes the company from the subject and the Neo IDs
++            from the body, and only looks at mail it hasn't handled before.{" "}
++            {status?.checkedUpTo ? <>Checked up to <b>{when(status.checkedUpTo)}</b>.</> : status ? <>Nothing has been synced yet.</> : null}
++          </p>
++          <div className="searchbar">
++            <label htmlFor="mail-since" className="sr-only">
++              Start from
++            </label>
++            <input
++              id="mail-since"
++              type="date"
++              value={since}
++              max={new Date().toISOString().slice(0, 10)}
++              onChange={(e) => setSince(e.target.value)}
++              style={{ maxWidth: 190 }}
++            />
++            <button className="btn primary" onClick={check} disabled={busy || !status || (!status.checkedUpTo && !since)}>
++              {busy && !preview ? "Checking…" : "Check mail"}
++            </button>
++          </div>
++          <p className="hint">
++            {status?.checkedUpTo
++              ? "Leave the date empty to continue from where the last sync stopped, or pick an earlier date to look further back."
++              : "Pick the date to start from. Nothing is saved until you confirm."}
++          </p>
++        </>
++      )}
++
++      {error && (
++        <div className="notice bad" role="alert">
++          {error}
++        </div>
++      )}
++
++      {saved && (
++        <div className="notice ok" role="status">
++          Saved {saved.saved.length} {saved.saved.length === 1 ? "mail" : "mails"}
++          {saved.skipped > 0 && <>, skipped {saved.skipped}</>}.
++          {saved.saved.length > 0 && (
++            <ul>
++              {saved.saved.map((r, i) => (
++                <li key={i}>
++                  {r.company}: {r.added} added{r.alreadyIn > 0 && <>, {r.alreadyIn} already there</>}
++                  {r.unknownStudents > 0 && <>, {r.unknownStudents} with no student record yet</>}
++                </li>
++              ))}
++            </ul>
++          )}
++        </div>
++      )}
++
++      {preview && (
++        <div role="status">
++          {preview.mails.length === 0 ? (
++            <p className="empty">
++              No new mail since {when(preview.since)}
++              {preview.alreadySynced > 0 && <> ({preview.alreadySynced} already handled)</>}.
++            </p>
++          ) : (
++            <>
++              <p className="hint">
++                {preview.mails.length} new {preview.mails.length === 1 ? "mail" : "mails"} since {when(preview.since)}.
++                Fix a company name if it's wrong, or clear it to skip that mail.
++                {preview.waiting > 0 && <> {preview.waiting} more are waiting. Save these, then check again.</>}
++              </p>
++              <div className="table-wrap">
++                <table>
++                  <thead>
++                    <tr>
++                      <th scope="col">Received</th>
++                      <th scope="col">Subject</th>
++                      <th scope="col">Company</th>
++                      <th scope="col">Neo IDs</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {preview.mails.map((m) => (
++                      <tr key={m.id}>
++                        <td>{when(m.date)}</td>
++                        <td>{m.subject || <span className="none">(no subject)</span>}</td>
++                        <td>
++                          <input
++                            type="text"
++                            aria-label={`Company for: ${m.subject}`}
++                            value={companies[m.id] ?? ""}
++                            maxLength={100}
++                            disabled={m.ids.length === 0}
++                            placeholder={m.company === null ? "Type the company" : ""}
++                            onChange={(e) => setCompanies((c) => ({ ...c, [m.id]: e.target.value }))}
++                          />
++                        </td>
++                        <td className="num">
++                          {m.ids.length > 0 ? m.ids.length : <span className="none">none found, will be skipped</span>}
++                        </td>
++                      </tr>
++                    ))}
++                  </tbody>
++                </table>
++              </div>
++              <div className="row" style={{ marginTop: 12 }}>
++                <button className="btn primary" onClick={save} disabled={busy}>
++                  {busy ? "Saving…" : `Save ${willSave.length} ${willSave.length === 1 ? "mail" : "mails"}`}
++                </button>
++                <button className="btn quiet" onClick={() => setPreview(null)} disabled={busy}>
++                  Discard
++                </button>
++              </div>
++            </>
++          )}
++        </div>
++      )}
++    </section>
++  );
++}
++
++/* ------------------------------------------------------------------ */
++
+ function describePlacement(r: PlacementResult): string {
+   const students = (n: number) => `${fmt(n)} ${n === 1 ? "student" : "students"}`;
+   const parts: string[] = [];
+diff --git a/src/app/api/admin/mail/route.ts b/src/app/api/admin/mail/route.ts
+new file mode 100644
+index 0000000..b45ef03
+--- /dev/null
++++ b/src/app/api/admin/mail/route.ts
+@@ -0,0 +1,8 @@
++import { getReadyDb } from "@/lib/db";
++import { handle, json, requireAdmin } from "@/lib/http";
++import { mailSyncStatus } from "@/lib/mailSync";
++
++export const GET = handle(async (request) => {
++  await requireAdmin(request);
++  return json(await mailSyncStatus(await getReadyDb()));
++});
+diff --git a/src/app/api/admin/mail/save/route.ts b/src/app/api/admin/mail/save/route.ts
+new file mode 100644
+index 0000000..8134911
+--- /dev/null
++++ b/src/app/api/admin/mail/save/route.ts
+@@ -0,0 +1,10 @@
++import { getReadyDb } from "@/lib/db";
++import { handle, json, readJson, requireAdmin } from "@/lib/http";
++import { saveSync, validateDecisions } from "@/lib/mailSync";
++
++/** Saves the mails the admin confirmed and moves the "last synced" date forward. */
++export const POST = handle(async (request) => {
++  await requireAdmin(request);
++  const decisions = validateDecisions(await readJson(request));
++  return json(await saveSync(await getReadyDb(), decisions));
++});
+diff --git a/src/app/api/admin/mail/sync/route.ts b/src/app/api/admin/mail/sync/route.ts
+new file mode 100644
+index 0000000..91a23fa
+--- /dev/null
++++ b/src/app/api/admin/mail/sync/route.ts
+@@ -0,0 +1,18 @@
++import { getReadyDb } from "@/lib/db";
++import { createGmailClient, gmailConfigured } from "@/lib/gmail";
++import { handle, json, readJson, requireAdmin } from "@/lib/http";
++import { previewSync } from "@/lib/mailSync";
++import { HttpError } from "@/lib/students";
++
++/** Reads new mail and returns what it found. Saves nothing. */
++export const POST = handle(async (request) => {
++  await requireAdmin(request);
++  if (!gmailConfigured()) {
++    throw new HttpError(
++      400,
++      "Mail sync isn't set up yet. Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN (see the README).",
++    );
++  }
++  const body = (await readJson(request)) as { since?: unknown } | null;
++  return json(await previewSync(await getReadyDb(), createGmailClient(), { since: body?.since }));
++});
+diff --git a/src/lib/db.ts b/src/lib/db.ts
+index f85025c..303e762 100644
+--- a/src/lib/db.ts
++++ b/src/lib/db.ts
+@@ -128,6 +128,23 @@ async function ensureSchema(db: Db): Promise<void> {
+         primary key (neo_id, company_key)
+       )`);
+     await tx.query("create index if not exists placements_company_idx on placements (company_key)");
++    // Mail sync: one row remembering how far the last sync got, and one row per mail already handled.
++    await tx.query(`
++      create table if not exists mail_sync (
++        id          integer primary key check (id = 1),
++        cursor      timestamptz not null,
++        last_run_at timestamptz not null default now()
++      )`);
++    await tx.query(`
++      create table if not exists synced_mails (
++        message_id    text primary key,
++        subject       text not null,
++        mail_date     timestamptz not null,
++        company       text,
++        student_count integer not null default 0,
++        status        text not null check (status in ('saved', 'skipped')),
++        synced_at     timestamptz not null default now()
++      )`);
+     await tx.query(`
+       create table if not exists login_throttle (
+         ip           text primary key,
+diff --git a/src/lib/gmail.ts b/src/lib/gmail.ts
+new file mode 100644
+index 0000000..c713ac3
+--- /dev/null
++++ b/src/lib/gmail.ts
+@@ -0,0 +1,153 @@
++import { readEnv } from "./env";
++import { htmlToText } from "./mailParse";
++import { HttpError } from "./students";
++
++/**
++ * A small Gmail reader: sign in with a saved refresh token, search, and fetch messages.
++ *
++ * It only ever reads (the gmail.readonly permission), and only through the search
++ * the app builds. It uses plain `fetch`, so it runs on Cloudflare Workers too.
++ */
++
++export interface GmailMessage {
++  id: string;
++  subject: string;
++  from: string;
++  /** When Gmail received the message, as an ISO timestamp. */
++  date: string;
++  /** The message body as plain text. */
++  text: string;
++}
++
++export interface GmailClient {
++  /** Ids of messages matching a Gmail search, newest first, at most `max` of them. */
++  listMessageIds(query: string, max: number): Promise<string[]>;
++  getMessage(id: string): Promise<GmailMessage>;
++}
++
++export const GOOGLE_SETTINGS = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN"] as const;
++
++export function gmailConfigured(): boolean {
++  return GOOGLE_SETTINGS.every((name) => Boolean(readEnv(name)));
++}
++
++const REAUTH =
++  "Google no longer accepts the saved Gmail login. Create a new refresh token and update GOOGLE_REFRESH_TOKEN (see the README).";
++
++type FetchFn = typeof fetch;
++// Wrapped so the global fetch is always called as a plain function, which Workers requires.
++const defaultFetch: FetchFn = (input, init) => fetch(input, init);
++
++interface Part {
++  mimeType?: string;
++  filename?: string;
++  headers?: { name: string; value: string }[];
++  body?: { data?: string };
++  parts?: Part[];
++}
++
++function decodeBase64Url(data: string): string {
++  const b64 = data.replace(/-/g, "+").replace(/_/g, "/");
++  const binary = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
++  return new TextDecoder("utf-8").decode(Uint8Array.from(binary, (c) => c.charCodeAt(0)));
++}
++
++function collectText(part: Part, plain: string[], html: string[]) {
++  const type = (part.mimeType ?? "").toLowerCase();
++  if (part.body?.data && !part.filename) {
++    if (type === "text/plain") plain.push(decodeBase64Url(part.body.data));
++    else if (type === "text/html") html.push(decodeBase64Url(part.body.data));
++  }
++  for (const child of part.parts ?? []) collectText(child, plain, html);
++}
++
++function header(part: Part, name: string): string {
++  const wanted = name.toLowerCase();
++  return part.headers?.find((h) => h.name.toLowerCase() === wanted)?.value ?? "";
++}
++
++export function createGmailClient(fetchFn: FetchFn = defaultFetch): GmailClient {
++  let tokenPromise: Promise<string> | undefined;
++
++  async function accessToken(): Promise<string> {
++    tokenPromise ??= (async () => {
++      const res = await fetchFn("https://oauth2.googleapis.com/token", {
++        method: "POST",
++        headers: { "content-type": "application/x-www-form-urlencoded" },
++        body: new URLSearchParams({
++          client_id: readEnv("GOOGLE_CLIENT_ID") ?? "",
++          client_secret: readEnv("GOOGLE_CLIENT_SECRET") ?? "",
++          refresh_token: readEnv("GOOGLE_REFRESH_TOKEN") ?? "",
++          grant_type: "refresh_token",
++        }),
++      });
++      if (!res.ok) {
++        const body = (await res.json().catch(() => ({}))) as { error?: string };
++        if (body.error === "invalid_grant" || body.error === "unauthorized_client") throw new HttpError(502, REAUTH);
++        if (body.error === "invalid_client") {
++          throw new HttpError(502, "Google doesn't recognise GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET. Check both values.");
++        }
++        throw new HttpError(502, `Couldn't sign in to Google (error ${res.status}).`);
++      }
++      const { access_token } = (await res.json()) as { access_token?: string };
++      if (!access_token) throw new HttpError(502, "Google didn't return an access token.");
++      return access_token;
++    })();
++    try {
++      return await tokenPromise;
++    } catch (err) {
++      tokenPromise = undefined; // let a later call try again
++      throw err;
++    }
++  }
++
++  async function gmail<T>(path: string): Promise<T> {
++    const res = await fetchFn(`https://gmail.googleapis.com/gmail/v1/users/me/${path}`, {
++      headers: { authorization: `Bearer ${await accessToken()}` },
++    });
++    if (res.ok) return (await res.json()) as T;
++    if (res.status === 401) throw new HttpError(502, REAUTH);
++    if (res.status === 403) {
++      throw new HttpError(
++        502,
++        "Gmail refused access. Check that the Gmail API is enabled for your Google project and the login was given read access to Gmail.",
++      );
++    }
++    if (res.status === 429) throw new HttpError(502, "Gmail is limiting requests right now. Try again in a minute.");
++    throw new HttpError(502, `Gmail returned an error (${res.status}).`);
++  }
++
++  return {
++    async listMessageIds(query, max) {
++      const ids: string[] = [];
++      let pageToken: string | undefined;
++      do {
++        const params = new URLSearchParams({ q: query, maxResults: String(Math.min(100, max - ids.length)) });
++        if (pageToken) params.set("pageToken", pageToken);
++        const page = await gmail<{ messages?: { id: string }[]; nextPageToken?: string }>(`messages?${params}`);
++        for (const m of page.messages ?? []) ids.push(m.id);
++        pageToken = page.nextPageToken;
++      } while (pageToken && ids.length < max);
++      return ids;
++    },
++
++    async getMessage(id) {
++      const m = await gmail<{ id: string; internalDate?: string; payload?: Part }>(
++        `messages/${encodeURIComponent(id)}?format=full`,
++      );
++      const payload = m.payload ?? {};
++      const plain: string[] = [];
++      const html: string[] = [];
++      collectText(payload, plain, html);
++      const text = plain.length > 0 ? plain.join("\n") : html.map(htmlToText).join("\n");
++      const received = Number(m.internalDate);
++      return {
++        id: m.id,
++        subject: header(payload, "Subject"),
++        from: header(payload, "From"),
++        date: new Date(Number.isFinite(received) ? received : Date.now()).toISOString(),
++        text,
++      };
++    },
++  };
++}
+diff --git a/src/lib/mailParse.ts b/src/lib/mailParse.ts
+new file mode 100644
+index 0000000..3bc9621
+--- /dev/null
++++ b/src/lib/mailParse.ts
+@@ -0,0 +1,72 @@
++import { classifyTokens, tokenize } from "./neo";
++
++/**
++ * Reading a "selection list" email.
++ *
++ * The subject names the company and the kind of drive; the body lists the Neo IDs:
++ *
++ *   Congratulations !! Sobha Limited Dream Core Internship selection list - 2027 Batch !!
++ *   Congratulations !! Myntra Super Dream Internship Selection list - 2027 Batch !!
++ *   Congratulations!! Urban Company Dream Internship / Placement Offer Selection List - 2027 Batch - VLR
++ *   Congratulations !! Valeo Regular Internship Selection List!! - Additional
++ *   Congratulations ! E.I.D. – Parry (India) Murugappa Group Dream Core Internship Selection List!!
++ *
++ * So the company is the text between the "Congratulations" greeting and the
++ * drive type ("Dream Core Internship", "Super Dream Internship", "Regular
++ * Internship", ...). When a subject doesn't fit, the company comes back null
++ * and the admin types it in; nothing is guessed.
++ */
++
++// A drive type is a tier word followed by what's being offered, e.g. "Super Dream Internship".
++const TIER_AND_KIND =
++  /\b(?:(?:super|open)\s+dream(?:\s+core)?|dream(?:\s+core)?|regular|core|marquee)\s+(?:internship|placement|offer|ppo|selection)\b/i;
++// Fallback when there's no tier word: cut at the first "Internship", "Placement", ...
++const KIND = /\b(?:internship|placement|offer|ppo|selection)\b/i;
++
++const EDGE_PUNCTUATION = /^[\s!,:;|/–—-]+|[\s!,:;|/–—-]+$/g;
++const MAX_COMPANY_LENGTH = 100;
++
++export function extractCompany(subject: string): string | null {
++  let s = subject.replace(/\s+/g, " ").trim();
++  s = s.replace(/^(?:(?:re|fwd?)\s*:\s*)+/i, "");
++  if (!/selection\s+list/i.test(s)) return null;
++
++  s = s.replace(/^(?:congratulations|congrats)\b[\s!.,:–—-]*/i, "");
++
++  let cut = s.search(TIER_AND_KIND);
++  if (cut === -1) cut = s.search(KIND);
++  if (cut === -1) return null;
++
++  const company = s.slice(0, cut).replace(EDGE_PUNCTUATION, "");
++  return company === "" || company.length > MAX_COMPANY_LENGTH ? null : company;
++}
++
++/**
++ * Every Neo ID in the text, upper-case, in order of first appearance.
++ *
++ * A word only counts when the whole word is a Neo ID, so a web address or a
++ * longer code that happens to contain eight matching characters is not picked up.
++ */
++export function extractNeoIds(text: string): string[] {
++  const ids: string[] = [];
++  for (const t of classifyTokens(tokenize(text))) if (t.status === "valid") ids.push(t.id);
++  return ids;
++}
++
++const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
++
++/** Plain text from an HTML email body: line breaks at block ends, tags and entities removed. */
++export function htmlToText(html: string): string {
++  return html
++    .replace(/<(style|script)\b[\s\S]*?<\/\1>/gi, " ")
++    .replace(/<br\s*\/?>|<\/(?:p|div|tr|li|h[1-6]|table)>/gi, "\n")
++    .replace(/<\/t[dh]>/gi, " ")
++    .replace(/<[^>]*>/g, " ")
++    .replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (whole, body: string) => {
++      if (body[0] === "#") {
++        const code = body[1].toLowerCase() === "x" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
++        return Number.isFinite(code) && code > 0 && code < 0x110000 ? String.fromCodePoint(code) : " ";
++      }
++      return ENTITIES[body.toLowerCase()] ?? whole;
++    });
++}
+diff --git a/src/lib/mailSync.ts b/src/lib/mailSync.ts
+new file mode 100644
+index 0000000..64a6d51
+--- /dev/null
++++ b/src/lib/mailSync.ts
+@@ -0,0 +1,253 @@
++import type { Db } from "./db";
++import { readEnv } from "./env";
++import { gmailConfigured, type GmailClient } from "./gmail";
++import { extractCompany, extractNeoIds } from "./mailParse";
++import { isValidNeoId, normalizeNeoId } from "./neo";
++import { changePlacements } from "./placements";
++import { HttpError, MAX_LOOKUP_TOKENS } from "./students";
++
++/**
++ * Syncing placements from Gmail.
++ *
++ * A sync is two steps so nothing is saved by surprise:
++ *   1. previewSync reads the mail that arrived since the last sync and works out
++ *      the company and Neo IDs of each one. It writes nothing.
++ *   2. saveSync stores what the admin confirmed (they can correct a company name
++ *      first) and moves the "last synced" date forward.
++ *
++ * Mails already handled are remembered by Gmail message id, so a mail is never
++ * processed twice, and the search deliberately starts a little before the saved
++ * date to catch mail Gmail was slow to index.
++ */
++
++/** Gmail search used to find selection lists. Override with MAIL_SYNC_QUERY (e.g. add `from:...`). */
++export const DEFAULT_MAIL_QUERY = 'subject:"selection list"';
++
++/** Mails read per sync. Keeps one click inside the free Cloudflare plan's limit of 50 outside requests. */
++export const MAX_MAILS_PER_SYNC = 25;
++const MAX_LISTED = 300;
++const OVERLAP_MS = 2 * 24 * 3600_000;
++const FETCH_CONCURRENCY = 5;
++
++export function mailQuery(): string {
++  return readEnv("MAIL_SYNC_QUERY")?.trim() || DEFAULT_MAIL_QUERY;
++}
++
++export interface MailPreview {
++  id: string;
++  subject: string;
++  from: string;
++  date: string;
++  /** The company worked out from the subject, or null when it couldn't be. */
++  company: string | null;
++  ids: string[];
++}
++
++export interface SyncPreview {
++  query: string;
++  /** Where the search started. */
++  since: string;
++  /** Mails that matched the search in that window. */
++  matched: number;
++  /** Of those, how many were already handled in an earlier sync. */
++  alreadySynced: number;
++  /** New mails, oldest first, at most MAX_MAILS_PER_SYNC. */
++  mails: MailPreview[];
++  /** New mails left for the next sync because of the cap. */
++  waiting: number;
++}
++
++export interface MailSyncStatus {
++  configured: boolean;
++  query: string;
++  /** When a sync last saved, or null if none has. */
++  lastSyncedAt: string | null;
++  /** Mail up to this moment has been handled. */
++  checkedUpTo: string | null;
++}
++
++export async function mailSyncStatus(db: Db): Promise<MailSyncStatus> {
++  const { rows } = await db.query<{ cursor: Date | string; last_run_at: Date | string }>(
++    "select cursor, last_run_at from mail_sync where id = 1",
++  );
++  const iso = (v: Date | string) => new Date(v).toISOString();
++  return {
++    configured: gmailConfigured(),
++    query: mailQuery(),
++    lastSyncedAt: rows[0] ? iso(rows[0].last_run_at) : null,
++    checkedUpTo: rows[0] ? iso(rows[0].cursor) : null,
++  };
++}
++
++function parseSinceDate(value: unknown): Date | null {
++  if (value === undefined || value === null || value === "") return null;
++  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
++    throw new HttpError(400, "Choose the start date again.");
++  }
++  const date = new Date(`${value}T00:00:00Z`);
++  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
++    throw new HttpError(400, "That isn't a real date.");
++  }
++  if (date.getTime() > Date.now() + 24 * 3600_000) throw new HttpError(400, "The start date can't be in the future.");
++  return date;
++}
++
++async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
++  const out: R[] = new Array(items.length);
++  let next = 0;
++  await Promise.all(
++    Array.from({ length: Math.min(limit, items.length) }, async () => {
++      while (next < items.length) {
++        const i = next++;
++        out[i] = await fn(items[i]);
++      }
++    }),
++  );
++  return out;
++}
++
++export async function previewSync(
++  db: Db,
++  gmail: GmailClient,
++  options: { since?: unknown; query?: string },
++): Promise<SyncPreview> {
++  const query = options.query ?? mailQuery();
++  const chosen = parseSinceDate(options.since);
++
++  const { rows: cursorRows } = await db.query<{ cursor: Date | string }>("select cursor from mail_sync where id = 1");
++  const cursor = cursorRows[0] ? new Date(cursorRows[0].cursor) : null;
++
++  // An explicit date wins; otherwise continue a little before where the last sync stopped.
++  let since: Date;
++  if (chosen) since = chosen;
++  else if (cursor) since = new Date(cursor.getTime() - OVERLAP_MS);
++  else throw new HttpError(400, "This is the first sync. Choose the date to start from.");
++
++  // Seconds, not a date: Gmail reads a plain date as midnight Pacific time.
++  const listed = await gmail.listMessageIds(`${query} after:${Math.floor(since.getTime() / 1000)}`, MAX_LISTED);
++
++  let handled = new Set<string>();
++  if (listed.length > 0) {
++    const { rows } = await db.query<{ message_id: string }>(
++      "select message_id from synced_mails where message_id in (select jsonb_array_elements_text($1::jsonb))",
++      [JSON.stringify(listed)],
++    );
++    handled = new Set(rows.map((r) => r.message_id));
++  }
++
++  // Gmail lists newest first; work oldest first so "last synced" only ever moves forward.
++  const fresh = listed.filter((id) => !handled.has(id)).reverse();
++  const batch = fresh.slice(0, MAX_MAILS_PER_SYNC);
++
++  const mails = await mapLimit(batch, FETCH_CONCURRENCY, async (id): Promise<MailPreview> => {
++    const m = await gmail.getMessage(id);
++    return { id: m.id, subject: m.subject, from: m.from, date: m.date, company: extractCompany(m.subject), ids: extractNeoIds(m.text) };
++  });
++  mails.sort((a, b) => a.date.localeCompare(b.date));
++
++  return {
++    query,
++    since: since.toISOString(),
++    matched: listed.length,
++    alreadySynced: handled.size,
++    mails,
++    waiting: fresh.length - batch.length,
++  };
++}
++
++/* ------------------------------------------------------------------ */
++
++export interface MailDecision {
++  id: string;
++  subject: string;
++  date: string;
++  /** The company to save these students under, or null to skip the mail. */
++  company: string | null;
++  ids: string[];
++}
++
++export interface SavedMail {
++  company: string;
++  added: number;
++  alreadyIn: number;
++  unknownStudents: number;
++}
++
++export interface SaveResult {
++  saved: SavedMail[];
++  skipped: number;
++  checkedUpTo: string | null;
++}
++
++const MAX_DECISIONS = 100;
++
++export function validateDecisions(body: unknown): MailDecision[] {
++  const list = (body as { mails?: unknown } | null)?.mails;
++  if (!Array.isArray(list)) throw new HttpError(400, "Expected a list of mails.");
++  if (list.length > MAX_DECISIONS) throw new HttpError(413, `Send at most ${MAX_DECISIONS} mails at a time.`);
++
++  const seen = new Set<string>();
++  return list.map((raw) => {
++    const m = raw as Partial<MailDecision> | null;
++    if (!m || typeof m.id !== "string" || m.id === "" || m.id.length > 200) throw new HttpError(400, "A mail is missing its id.");
++    if (seen.has(m.id)) throw new HttpError(400, "The same mail was sent twice.");
++    seen.add(m.id);
++
++    const date = new Date(typeof m.date === "string" ? m.date : NaN);
++    if (Number.isNaN(date.getTime())) throw new HttpError(400, "A mail has no valid date.");
++
++    if (m.company !== null && m.company !== undefined && typeof m.company !== "string") throw new HttpError(400, "Invalid company.");
++    if (!Array.isArray(m.ids) || m.ids.length > MAX_LOOKUP_TOKENS) throw new HttpError(400, "Invalid list of Neo IDs.");
++    const ids = [...new Set(m.ids.map((x) => {
++      if (typeof x !== "string" || !isValidNeoId(x.trim())) throw new HttpError(400, `Invalid Neo ID: ${JSON.stringify(x)}.`);
++      return normalizeNeoId(x);
++    }))];
++
++    return {
++      id: m.id,
++      subject: typeof m.subject === "string" ? m.subject.slice(0, 500) : "",
++      date: date.toISOString(),
++      company: typeof m.company === "string" && m.company.trim() !== "" ? m.company : null,
++      ids,
++    };
++  });
++}
++
++export async function saveSync(db: Db, decisions: MailDecision[]): Promise<SaveResult> {
++  return db.transaction(async (tx) => {
++    const saved: SavedMail[] = [];
++    let skipped = 0;
++    let newest: string | null = null;
++
++    for (const d of decisions) {
++      if (newest === null || d.date > newest) newest = d.date;
++
++      const keep = d.company !== null && d.ids.length > 0;
++      if (keep) {
++        const r = await changePlacements(tx, { action: "add", company: d.company, text: d.ids.join(" ") });
++        saved.push({ company: r.company, added: r.added, alreadyIn: r.alreadyIn, unknownStudents: r.unknownStudents.count });
++      } else {
++        skipped++;
++      }
++
++      await tx.query(
++        `insert into synced_mails (message_id, subject, mail_date, company, student_count, status)
++         values ($1, $2, $3, $4, $5, $6)
++         on conflict (message_id) do nothing`,
++        [d.id, d.subject, d.date, keep ? d.company : null, keep ? d.ids.length : 0, keep ? "saved" : "skipped"],
++      );
++    }
++
++    // "Last synced" only moves forward, and never past mail that wasn't part of this save.
++    if (newest !== null) {
++      await tx.query(
++        `insert into mail_sync (id, cursor, last_run_at) values (1, $1, now())
++         on conflict (id) do update
++           set cursor = greatest(mail_sync.cursor, excluded.cursor), last_run_at = now()`,
++        [newest],
++      );
++    }
++    const { rows } = await tx.query<{ cursor: Date | string }>("select cursor from mail_sync where id = 1");
++    return { saved, skipped, checkedUpTo: rows[0] ? new Date(rows[0].cursor).toISOString() : null };
++  });
++}
+diff --git a/tests/mail.test.ts b/tests/mail.test.ts
+new file mode 100644
+index 0000000..b0cc54f
+--- /dev/null
++++ b/tests/mail.test.ts
+@@ -0,0 +1,455 @@
++import assert from "node:assert/strict";
++import { afterEach, before, beforeEach, describe, it } from "node:test";
++import { getReadyDb } from "../src/lib/db";
++import { createGmailClient, gmailConfigured, type GmailClient, type GmailMessage } from "../src/lib/gmail";
++import { extractCompany, extractNeoIds, htmlToText } from "../src/lib/mailParse";
++import { MAX_MAILS_PER_SYNC, mailSyncStatus, previewSync, saveSync, validateDecisions } from "../src/lib/mailSync";
++import { adminSummary, lookupStudents } from "../src/lib/students";
++import { freshDb } from "./helpers";
++
++/* ---------------------------------------------------------------- parsing */
++
++describe("Company from the subject line", () => {
++  const cases: [string, string | null][] = [
++    ["Congratulations ! E.I.D. – Parry (India) Murugappa Group Dream Core Internship Selection List!!", "E.I.D. – Parry (India) Murugappa Group"],
++    ["Congratulations !! Sobha Limited Dream Core Internship selection list - 2027 Batch !!", "Sobha Limited"],
++    ["Congratulations !! Myntra Super Dream Internship Selection list - 2027 Batch !!", "Myntra"],
++    ["Congratulations!! Urban Company Dream Internship / Placement Offer Selection List - 2027 Batch - VLR", "Urban Company"],
++    ["Congratulations !! Valeo Regular Internship Selection List!! - Additional", "Valeo"],
++    // other shapes
++    ["Re: Fwd: Congratulations !! Valeo Regular Internship Selection List", "Valeo"],
++    ["CONGRATULATIONS!! VALEO REGULAR INTERNSHIP SELECTION LIST", "VALEO"],
++    ["Congratulations !! Core Compete Dream Internship Selection List", "Core Compete"],
++    ["Congratulations !! Dream11 Super Dream Internship Selection List", "Dream11"],
++    ["Congratulations !! Acme Internship Selection List", "Acme"],
++    ["Congratulations !! Acme Marquee Placement Selection List", "Acme"],
++    ["  Congratulations   !!   Tata   Steel  Dream  Internship  Selection List ", "Tata Steel"],
++    // not usable: the admin types the company in
++    ["Interview schedule for Google - 2027 batch", null],
++    ["Congratulations !! Selection List", null],
++    ["Congratulations !! Dream Internship Selection List", null],
++    ["", null],
++  ];
++  for (const [subject, company] of cases) {
++    it(`${JSON.stringify(company)} <- ${subject.trim().slice(0, 60)}`, () => assert.equal(extractCompany(subject), company));
++  }
++  it("refuses an absurdly long company", () => {
++    assert.equal(extractCompany(`Congratulations ${"x".repeat(150)} Dream Internship Selection List`), null);
++  });
++});
++
++describe("Neo IDs from the body", () => {
++  it("reads the layouts seen in real mails", () => {
++    const withLabel = "Congratulations !! \n\nSobha Limited Dream Core Internship selection list - 2027 Batch !!\n\n\nNeo ID\nQ1W2E3R4\nZ9X8C7V6\n";
++    assert.deepEqual(extractNeoIds(withLabel), ["Q1W2E3R4", "Z9X8C7V6"]);
++    const noLabel = "Congratulations !\n\n E.I.D. – Parry (India) Murugappa Group Dream Core Internship Selection List!!\n\nP0O9I8U7\nL1K2J3H4\n";
++    assert.deepEqual(extractNeoIds(noLabel), ["P0O9I8U7", "L1K2J3H4"]);
++    assert.deepEqual(extractNeoIds("NEO ID\nM5N6B7V8\n"), ["M5N6B7V8"]);
++  });
++  it("accepts IDs separated by commas, spaces or in a table, any case, once each", () => {
++    assert.deepEqual(extractNeoIds("q1w2e3r4, Z9X8C7V6 ; P0O9I8U7\tL1K2J3H4 Q1W2E3R4"), ["Q1W2E3R4", "Z9X8C7V6", "P0O9I8U7", "L1K2J3H4"]);
++  });
++  it("does not pick IDs out of web addresses or longer codes", () => {
++    const footer = "https://groups.google.com/a/example.ac.in/d/msgid/q1w2e3r4/CAB1C2D3E4F5 ref-A1B2C3D4E5 vitianscdc2027+unsubscribe@example.ac.in";
++    assert.deepEqual(extractNeoIds(footer), []);
++  });
++  it("finds nothing in a mail without IDs", () => assert.deepEqual(extractNeoIds("Congratulations to all! 2027 Batch"), []));
++});
++
++describe("HTML bodies", () => {
++  it("turns an HTML list into lines of text", () => {
++    const html = "<html><head><style>p{color:red}</style></head><body><p>Neo&nbsp;ID</p><div>Q1W2E3R4<br>Z9X8C7V6</div><table><tr><td>P0O9I8U7</td><td>L1K2J3H4</td></tr></table></body></html>";
++    assert.deepEqual(extractNeoIds(htmlToText(html)), ["Q1W2E3R4", "Z9X8C7V6", "P0O9I8U7", "L1K2J3H4"]);
++    assert.ok(!htmlToText(html).includes("color:red"));
++  });
++  it("decodes entities, including numbers", () => {
++    assert.equal(htmlToText("A &amp; B &lt;C&gt; &#8211; &#x41; &quot;").replace(/\s+/g, " ").trim(), 'A & B <C> – A "');
++    assert.equal(htmlToText("&#99999999999;").trim(), "", "out-of-range numbers don't throw");
++  });
++});
++
++/* ------------------------------------------------------- Gmail client */
++
++const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64url");
++const ENV = { GOOGLE_CLIENT_ID: "cid", GOOGLE_CLIENT_SECRET: "secret", GOOGLE_REFRESH_TOKEN: "refresh" };
++const savedEnv = { ...process.env };
++function setGoogleEnv() { Object.assign(process.env, ENV); }
++afterEach(() => {
++  for (const k of [...Object.keys(ENV), "MAIL_SYNC_QUERY"]) {
++    if (savedEnv[k] === undefined) delete process.env[k];
++    else process.env[k] = savedEnv[k];
++  }
++});
++
++interface Call { url: string; init?: RequestInit }
++function fakeFetch(routes: (url: URL, init?: RequestInit) => unknown | Response, calls: Call[] = []): typeof fetch {
++  return (async (input: RequestInfo | URL, init?: RequestInit) => {
++    const url = new URL(String(input));
++    calls.push({ url: url.toString(), init });
++    const out = routes(url, init);
++    if (out instanceof Response) return out;
++    return new Response(JSON.stringify(out), { status: 200, headers: { "content-type": "application/json" } });
++  }) as typeof fetch;
++}
++const tokenOk = (url: URL) => (url.hostname === "oauth2.googleapis.com" ? { access_token: "tok-1", expires_in: 3600 } : undefined);
++
++describe("Gmail client", () => {
++  it("reports whether it is set up", () => {
++    for (const k of Object.keys(ENV)) delete process.env[k];
++    assert.equal(gmailConfigured(), false);
++    setGoogleEnv();
++    assert.equal(gmailConfigured(), true);
++    delete process.env.GOOGLE_REFRESH_TOKEN;
++    assert.equal(gmailConfigured(), false);
++  });
++
++  it("exchanges the refresh token once and sends it as a bearer token", async () => {
++    setGoogleEnv();
++    const calls: Call[] = [];
++    const gmail = createGmailClient(fakeFetch((url) => tokenOk(url) ?? { messages: [{ id: "m1" }] }, calls));
++    await gmail.listMessageIds("subject:x", 10);
++    await gmail.listMessageIds("subject:x", 10);
++    const tokenCalls = calls.filter((c) => c.url.startsWith("https://oauth2.googleapis.com/token"));
++    assert.equal(tokenCalls.length, 1, "the token is reused");
++    const form = new URLSearchParams(String(tokenCalls[0].init!.body));
++    assert.deepEqual(Object.fromEntries(form), { client_id: "cid", client_secret: "secret", refresh_token: "refresh", grant_type: "refresh_token" });
++    const api = calls.find((c) => c.url.includes("gmail.googleapis.com"))!;
++    assert.equal((api.init!.headers as Record<string, string>).authorization, "Bearer tok-1");
++  });
++
++  it("follows pages until it has enough, and stops at the limit", async () => {
++    setGoogleEnv();
++    const calls: Call[] = [];
++    const pages: Record<string, unknown> = {
++      "": { messages: [{ id: "a" }, { id: "b" }], nextPageToken: "p2" },
++      p2: { messages: [{ id: "c" }, { id: "d" }], nextPageToken: "p3" },
++      p3: { messages: [{ id: "e" }] },
++    };
++    const gmail = createGmailClient(fakeFetch((url) => tokenOk(url) ?? pages[url.searchParams.get("pageToken") ?? ""], calls));
++    assert.deepEqual(await gmail.listMessageIds('subject:"selection list" after:100', 300), ["a", "b", "c", "d", "e"]);
++    const first = new URL(calls.find((c) => c.url.includes("/messages?"))!.url);
++    assert.equal(first.searchParams.get("q"), 'subject:"selection list" after:100');
++    assert.deepEqual(await gmail.listMessageIds("q", 3), ["a", "b", "c", "d"].slice(0, 4).slice(0, 4).length === 4 ? ["a", "b", "c", "d"] : []);
++  });
++
++  it("returns nothing when no mail matches", async () => {
++    setGoogleEnv();
++    const gmail = createGmailClient(fakeFetch((url) => tokenOk(url) ?? { resultSizeEstimate: 0 }));
++    assert.deepEqual(await gmail.listMessageIds("q", 10), []);
++  });
++
++  it("reads a nested multipart message, including non-English characters", async () => {
++    setGoogleEnv();
++    const message = {
++      id: "m1", internalDate: String(Date.UTC(2026, 9, 21, 9, 38, 0)),
++      payload: {
++        mimeType: "multipart/mixed",
++        headers: [{ name: "subject", value: "Congratulations !! Café – Dream Internship Selection List" }, { name: "From", value: "'No Reply' via Group <g@x.ac.in>" }],
++        parts: [
++          { mimeType: "multipart/alternative", parts: [
++            { mimeType: "text/plain", body: { data: b64("Neo ID\nQ1W2E3R4\nZ9X8C7V6 – ok") } },
++            { mimeType: "text/html", body: { data: b64("<p>HTML copy P0O9I8U7</p>") } },
++          ] },
++          { mimeType: "application/pdf", filename: "list.pdf", body: { data: b64("Q9Q9Q9Q9") } },
++        ],
++      },
++    };
++    const gmail = createGmailClient(fakeFetch((url) => tokenOk(url) ?? message));
++    const m: GmailMessage = await gmail.getMessage("m1");
++    assert.equal(m.subject, "Congratulations !! Café – Dream Internship Selection List");
++    assert.equal(m.from, "'No Reply' via Group <g@x.ac.in>");
++    assert.equal(m.date, "2026-10-21T09:38:00.000Z");
++    assert.deepEqual(extractNeoIds(m.text), ["Q1W2E3R4", "Z9X8C7V6"], "plain text wins; attachments are ignored");
++  });
++
++  it("falls back to HTML when there is no plain text", async () => {
++    setGoogleEnv();
++    const message = { id: "m2", internalDate: "1", payload: { mimeType: "text/html", headers: [], body: { data: b64("<div>Q1W2E3R4<br>Z9X8C7V6</div>") } } };
++    const m = await createGmailClient(fakeFetch((url) => tokenOk(url) ?? message)).getMessage("m2");
++    assert.deepEqual(extractNeoIds(m.text), ["Q1W2E3R4", "Z9X8C7V6"]);
++  });
++
++  it("explains each way Google can say no, without echoing Google's reply", async () => {
++    setGoogleEnv();
++    const failing = (status: number, body: unknown) => createGmailClient(fakeFetch(() => new Response(JSON.stringify(body), { status })));
++    await assert.rejects(failing(400, { error: "invalid_grant", error_description: "SECRET-DETAIL" }).listMessageIds("q", 1), (e: Error) => /no longer accepts/.test(e.message) && !e.message.includes("SECRET-DETAIL"));
++    await assert.rejects(failing(401, { error: "invalid_client" }).listMessageIds("q", 1), /GOOGLE_CLIENT_ID/);
++    await assert.rejects(failing(500, {}).listMessageIds("q", 1), /error 500/);
++
++    const apiFail = (status: number) => createGmailClient(fakeFetch((url) => tokenOk(url) ?? new Response("{}", { status })));
++    await assert.rejects(apiFail(401).listMessageIds("q", 1), /no longer accepts/);
++    await assert.rejects(apiFail(403).listMessageIds("q", 1), /Gmail refused access/);
++    await assert.rejects(apiFail(429).listMessageIds("q", 1), /limiting requests/);
++    await assert.rejects(apiFail(503).listMessageIds("q", 1), /\(503\)/);
++  });
++
++  it("tries the sign-in again after a failure instead of remembering it", async () => {
++    setGoogleEnv();
++    let n = 0;
++    const gmail = createGmailClient(fakeFetch((url) => {
++      if (url.hostname === "oauth2.googleapis.com") return ++n === 1 ? new Response("{}", { status: 500 }) : { access_token: "t" };
++      return { messages: [] };
++    }));
++    await assert.rejects(gmail.listMessageIds("q", 1));
++    assert.deepEqual(await gmail.listMessageIds("q", 1), []);
++  });
++});
++
++/* -------------------------------------------------------------- sync */
++
++const DAY = 86_400_000;
++const t0 = Date.UTC(2026, 9, 1, 6, 0, 0); // 1 Oct 2026
++
++class FakeGmail implements GmailClient {
++  messages: GmailMessage[] = [];
++  queries: string[] = [];
++  fetched: string[] = [];
++  add(id: string, subject: string, body: string, at: number) {
++    this.messages.push({ id, subject, from: "cdc@x.ac.in", date: new Date(at).toISOString(), text: body });
++  }
++  async listMessageIds(query: string, max: number) {
++    this.queries.push(query);
++    const after = Number(/after:(\d+)/.exec(query)?.[1] ?? 0);
++    return [...this.messages].filter((m) => Date.parse(m.date) >= after * 1000).sort((a, b) => b.date.localeCompare(a.date)).slice(0, max).map((m) => m.id);
++  }
++  async getMessage(id: string) {
++    this.fetched.push(id);
++    return this.messages.find((m) => m.id === id)!;
++  }
++}
++
++const SOBHA = "Congratulations !! Sobha Limited Dream Core Internship selection list - 2027 Batch !!";
++const MYNTRA = "Congratulations !! Myntra Super Dream Internship Selection list - 2027 Batch !!";
++const VALEO = "Congratulations !! Valeo Regular Internship Selection List!! - Additional";
++
++describe("Mail sync", () => {
++  let db: Awaited<ReturnType<typeof freshDb>>;
++  let gm: FakeGmail;
++  beforeEach(async () => {
++    await freshDb();
++    db = await getReadyDb();
++    gm = new FakeGmail();
++  });
++
++  const confirm = (p: Awaited<ReturnType<typeof previewSync>>) =>
++    validateDecisions({ mails: p.mails.map((m) => ({ id: m.id, subject: m.subject, date: m.date, company: m.company, ids: m.ids })) });
++
++  it("needs a start date the first time", async () => {
++    await assert.rejects(previewSync(db, gm, {}), { status: 400, message: /first sync/ });
++    assert.equal(gm.queries.length, 0, "Gmail isn't even asked");
++  });
++
++  it("reads new mail since the chosen date, oldest first, with company and IDs worked out", async () => {
++    gm.add("old", VALEO, "NEO ID\nM5N6B7V8", Date.UTC(2026, 8, 22, 5, 54)); // before the start date
++    gm.add("m2", MYNTRA, "Neo ID\nQ1W2E3R4\nZ9X8C7V6", t0 + 2 * DAY);
++    gm.add("m1", SOBHA, "Neo ID\nP0O9I8U7\nL1K2J3H4", t0 + 1 * DAY);
++    gm.add("m3", "Interview schedule for Google", "see you at 10:00", t0 + 3 * DAY);
++    const p = await previewSync(db, gm, { since: "2026-10-01" });
++    assert.match(gm.queries[0], /^subject:"selection list" after:\d+$/);
++    assert.equal(Number(/after:(\d+)/.exec(gm.queries[0])![1]), Date.UTC(2026, 9, 1) / 1000, "an exact timestamp, not a date");
++    assert.deepEqual(p.mails.map((m) => [m.id, m.company, m.ids]), [
++      ["m1", "Sobha Limited", ["P0O9I8U7", "L1K2J3H4"]],
++      ["m2", "Myntra", ["Q1W2E3R4", "Z9X8C7V6"]],
++      ["m3", null, []],
++    ]);
++    assert.equal(p.waiting, 0);
++    assert.equal(p.alreadySynced, 0);
++  });
++
++  it("saves nothing until confirmed", async () => {
++    gm.add("m1", SOBHA, "P0O9I8U7", t0 + DAY);
++    await previewSync(db, gm, { since: "2026-10-01" });
++    assert.equal((await adminSummary(db)).companies.length, 0);
++    assert.equal((await mailSyncStatus(db)).lastSyncedAt, null);
++  });
++
++  it("saves placements, remembers the date, and then only looks at newer mail", async () => {
++    gm.add("m1", SOBHA, "P0O9I8U7 L1K2J3H4", t0 + 1 * DAY);
++    gm.add("m2", MYNTRA, "Q1W2E3R4", t0 + 2 * DAY);
++    const saved = await saveSync(db, await previewSync(db, gm, { since: "2026-10-01" }).then(confirm));
++    assert.deepEqual(saved.saved.map((s) => [s.company, s.added]), [["Sobha Limited", 2], ["Myntra", 1]]);
++    assert.equal(saved.checkedUpTo, new Date(t0 + 2 * DAY).toISOString());
++    assert.deepEqual((await adminSummary(db)).companies, [{ name: "Myntra", count: 1 }, { name: "Sobha Limited", count: 2 }]);
++    assert.deepEqual((await lookupStudents(db, "P0O9I8U7")).rows[0].companies, ["Sobha Limited"]);
++
++    const status = await mailSyncStatus(db);
++    assert.equal(status.checkedUpTo, new Date(t0 + 2 * DAY).toISOString());
++    assert.ok(status.lastSyncedAt);
++
++    // a new mail arrives; the next sync (no date given) fetches only that one
++    gm.add("m3", VALEO, "NEO ID\nM5N6B7V8", t0 + 5 * DAY);
++    gm.fetched = [];
++    const next = await previewSync(db, gm, { });
++    assert.deepEqual(next.mails.map((m) => m.id), ["m3"]);
++    assert.deepEqual(gm.fetched, ["m3"], "mails handled before are not read again");
++    assert.equal(next.alreadySynced, 2, "the overlap window re-lists them, but they're recognised");
++    assert.equal(Number(/after:(\d+)/.exec(gm.queries.at(-1)!)![1]), (t0 + 2 * DAY - 2 * DAY) / 1000, "starts 2 days before the saved date");
++  });
++
++  it("finds nothing new when nothing arrived", async () => {
++    gm.add("m1", SOBHA, "P0O9I8U7", t0 + DAY);
++    await saveSync(db, await previewSync(db, gm, { since: "2026-10-01" }).then(confirm));
++    const again = await previewSync(db, gm, {});
++    assert.deepEqual(again.mails, []);
++    assert.equal(again.alreadySynced, 1);
++  });
++
++  it("catches a mail Gmail was slow to index, if it falls inside the overlap", async () => {
++    gm.add("m2", MYNTRA, "Q1W2E3R4", t0 + 3 * DAY);
++    await saveSync(db, await previewSync(db, gm, { since: "2026-10-01" }).then(confirm));
++    gm.add("late", SOBHA, "P0O9I8U7", t0 + 2 * DAY + 3600_000); // older than the saved date, but only by a day
++    assert.deepEqual((await previewSync(db, gm, {})).mails.map((m) => m.id), ["late"]);
++  });
++
++  it("reads at most 25 mails at a time and carries on with the rest next time", async () => {
++    for (let i = 0; i < 30; i++) gm.add(`m${String(i).padStart(2, "0")}`, SOBHA, `P0O9I8U7`, t0 + i * 3600_000);
++    const first = await previewSync(db, gm, { since: "2026-10-01" });
++    assert.equal(MAX_MAILS_PER_SYNC, 25);
++    assert.equal(first.mails.length, 25);
++    assert.equal(first.waiting, 5);
++    assert.equal(gm.fetched.length, 25, "only 25 mails are fetched, keeping within Cloudflare's request limit");
++    assert.equal(first.mails[0].id, "m00", "the oldest come first");
++    await saveSync(db, confirm(first));
++
++    const second = await previewSync(db, gm, {});
++    assert.deepEqual(second.mails.map((m) => m.id), ["m25", "m26", "m27", "m28", "m29"]);
++    assert.equal(second.waiting, 0);
++  });
++
++  it("lets the admin fill in a company the subject didn't give, and skip mails", async () => {
++    gm.add("odd", "Congratulations !! Selection List", "Q1W2E3R4", t0 + DAY);
++    gm.add("junk", "Selection list FAQ", "no ids here", t0 + 2 * DAY);
++    gm.add("skipme", VALEO, "M5N6B7V8", t0 + 3 * DAY);
++    const p = await previewSync(db, gm, { since: "2026-10-01" });
++    assert.equal(p.mails[0].company, null);
++    const decisions = validateDecisions({
++      mails: [
++        { id: "odd", subject: p.mails[0].subject, date: p.mails[0].date, company: "  Zoho  ", ids: p.mails[0].ids },
++        { id: "junk", subject: "x", date: p.mails[1].date, company: null, ids: [] },
++        { id: "skipme", subject: "x", date: p.mails[2].date, company: null, ids: ["M5N6B7V8"] },
++      ],
++    });
++    const r = await saveSync(db, decisions);
++    assert.deepEqual(r.saved.map((s) => s.company), ["Zoho"]);
++    assert.equal(r.skipped, 2);
++    assert.deepEqual((await adminSummary(db)).companies, [{ name: "Zoho", count: 1 }]);
++    // skipped mails are remembered, so they don't come back
++    assert.deepEqual((await previewSync(db, gm, {})).mails, []);
++  });
++
++  it("saving the same mails twice changes nothing", async () => {
++    gm.add("m1", SOBHA, "P0O9I8U7 L1K2J3H4", t0 + DAY);
++    const decisions = await previewSync(db, gm, { since: "2026-10-01" }).then(confirm);
++    await saveSync(db, decisions);
++    const again = await saveSync(db, decisions);
++    assert.deepEqual(again.saved.map((s) => [s.added, s.alreadyIn]), [[0, 2]]);
++    assert.deepEqual((await adminSummary(db)).companies, [{ name: "Sobha Limited", count: 2 }]);
++    const { rows } = await db.query<{ n: number }>("select count(*)::int as n from synced_mails");
++    assert.equal(rows[0].n, 1);
++  });
++
++  it("never moves the saved date backwards", async () => {
++    gm.add("new", SOBHA, "P0O9I8U7", t0 + 9 * DAY);
++    await saveSync(db, await previewSync(db, gm, { since: "2026-10-01" }).then(confirm));
++    const before = (await mailSyncStatus(db)).checkedUpTo;
++    gm.add("older", MYNTRA, "Q1W2E3R4", t0 + 1 * DAY);
++    const p = await previewSync(db, gm, { since: "2026-10-01" }); // admin re-scans from an earlier date
++    assert.deepEqual(p.mails.map((m) => m.id), ["older"]);
++    await saveSync(db, confirm(p));
++    assert.equal((await mailSyncStatus(db)).checkedUpTo, before);
++  });
++
++  it("is all-or-nothing: one bad company name saves none of the batch", async () => {
++    const decisions = validateDecisions({
++      mails: [
++        { id: "a", subject: "s", date: new Date(t0).toISOString(), company: "Good Co", ids: ["Q1W2E3R4"] },
++        { id: "b", subject: "s", date: new Date(t0 + DAY).toISOString(), company: "x".repeat(101), ids: ["Z9X8C7V6"] },
++      ],
++    });
++    await assert.rejects(saveSync(db, decisions), { status: 400 });
++    assert.equal((await adminSummary(db)).companies.length, 0);
++    assert.equal((await mailSyncStatus(db)).checkedUpTo, null);
++    assert.equal((await db.query("select 1 from synced_mails")).rows.length, 0);
++  });
++
++  it("rejects a bad start date", async () => {
++    for (const bad of ["yesterday", "2026-13-01", "2026-02-30", "01/10/2026", 5, "2099-01-01"]) {
++      await assert.rejects(previewSync(db, gm, { since: bad }), { status: 400 }, String(bad));
++    }
++    assert.equal(gm.queries.length, 0);
++  });
++
++  it("uses MAIL_SYNC_QUERY when set", async () => {
++    process.env.MAIL_SYNC_QUERY = 'from:cdc@x.ac.in subject:"selection list"';
++    gm.add("m1", SOBHA, "P0O9I8U7", t0 + DAY);
++    const p = await previewSync(db, gm, { since: "2026-10-01" });
++    assert.match(gm.queries[0], /^from:cdc@x\.ac\.in subject:"selection list" after:\d+$/);
++    assert.equal(p.query, 'from:cdc@x.ac.in subject:"selection list"');
++  });
++
++  it("checks what the browser sends before saving it", () => {
++    const good = { id: "a", subject: "s", date: "2026-10-01T00:00:00Z", company: "Co", ids: ["q1w2e3r4", "Q1W2E3R4"] };
++    assert.deepEqual(validateDecisions({ mails: [good] })[0].ids, ["Q1W2E3R4"], "normalised and de-duplicated");
++    const bad: unknown[] = [
++      null, {}, { mails: "x" },
++      { mails: [{ ...good, id: "" }] },
++      { mails: [{ ...good, date: "nope" }] },
++      { mails: [{ ...good, ids: ["not an id"] }] },
++      { mails: [{ ...good, ids: "Q1W2E3R4" }] },
++      { mails: [{ ...good, company: 5 }] },
++      { mails: [good, good] },
++      { mails: new Array(101).fill(0).map((_, i) => ({ ...good, id: `m${i}` })) },
++    ];
++    for (const b of bad) assert.throws(() => validateDecisions(b), { name: "Error" }, JSON.stringify(b)?.slice(0, 60));
++  });
++});
++
++/* ------------------------------------------------------------ routes */
++
++describe("Mail sync routes", () => {
++  let routes: { status: typeof import("../src/app/api/admin/mail/route"); sync: typeof import("../src/app/api/admin/mail/sync/route"); save: typeof import("../src/app/api/admin/mail/save/route") };
++  let cookie: string;
++  before(async () => {
++    process.env.ADMIN_PASSWORD = "pw-pw-pw";
++    process.env.SESSION_SECRET = "0123456789abcdef0123456789";
++    await freshDb();
++    routes = {
++      status: await import("../src/app/api/admin/mail/route"),
++      sync: await import("../src/app/api/admin/mail/sync/route"),
++      save: await import("../src/app/api/admin/mail/save/route"),
++    };
++    const { createSessionToken, SESSION_COOKIE } = await import("../src/lib/auth");
++    cookie = `${SESSION_COOKIE}=${await createSessionToken()}`;
++  });
++  const post = (url: string, body: unknown, withCookie = true) =>
++    new Request(`http://localhost${url}`, { method: "POST", headers: { "content-type": "application/json", ...(withCookie ? { cookie } : {}) }, body: JSON.stringify(body) });
++
++  it("is admin-only", async () => {
++    assert.equal((await routes.status.GET(new Request("http://localhost/api/admin/mail"))).status, 401);
++    assert.equal((await routes.sync.POST(post("/api/admin/mail/sync", {}, false))).status, 401);
++    assert.equal((await routes.save.POST(post("/api/admin/mail/save", { mails: [] }, false))).status, 401);
++  });
++
++  it("says plainly when Gmail isn't set up", async () => {
++    for (const k of Object.keys(ENV)) delete process.env[k];
++    const status = await (await routes.status.GET(new Request("http://localhost/api/admin/mail", { headers: { cookie } }))).json();
++    assert.equal(status.configured, false);
++    const res = await routes.sync.POST(post("/api/admin/mail/sync", { since: "2026-10-01" }));
++    assert.equal(res.status, 400);
++    assert.match((await res.json()).error, /GOOGLE_CLIENT_ID.*GOOGLE_REFRESH_TOKEN/);
++  });
++
++  it("reports configured once the settings exist, and saves confirmed mail", async () => {
++    setGoogleEnv();
++    const status = await (await routes.status.GET(new Request("http://localhost/api/admin/mail", { headers: { cookie } }))).json();
++    assert.equal(status.configured, true);
++    assert.equal(status.lastSyncedAt, null);
++
++    const res = await routes.save.POST(post("/api/admin/mail/save", { mails: [{ id: "x1", subject: "s", date: "2026-10-02T00:00:00Z", company: "Route Co", ids: ["Q1W2E3R4"] }] }));
++    assert.equal(res.status, 200);
++    const body = await res.json();
++    assert.deepEqual(body.saved.map((s: { company: string }) => s.company), ["Route Co"]);
++    assert.equal(body.checkedUpTo, "2026-10-02T00:00:00.000Z");
++    assert.equal((await routes.save.POST(post("/api/admin/mail/save", { mails: [{ id: "x2", date: "bad", ids: [] }] }))).status, 400);
++  });
++});

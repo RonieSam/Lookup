@@ -5,6 +5,7 @@ import { NeoIdText } from "@/components/NeoIdText";
 import { ApiError, api } from "@/lib/client";
 import { buildMapping, detectNeoColumn, parseRows, type MappedColumn } from "@/lib/columns";
 import type { FindResult } from "@/lib/find";
+import type { MailSyncStatus, SaveResult, SyncPreview } from "@/lib/mailSync";
 import { classifyTokens, tokenize } from "@/lib/neo";
 import type { PlacementResult } from "@/lib/placements";
 import { cellHas } from "@/lib/search";
@@ -162,6 +163,7 @@ function Dashboard({ summary, onChanged }: { summary: Summary; onChanged: () => 
 
       <FindStudents summary={summary} onChanged={onChanged} />
       <Uploader summary={summary} onChanged={onChanged} />
+      <MailSync onChanged={onChanged} />
       <Placements summary={summary} onChanged={onChanged} />
     </div>
   );
@@ -290,6 +292,209 @@ function FindStudents({ summary, onChanged }: { summary: Summary; onChanged: () 
                     ))}
                   </tbody>
                 </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+
+function MailSync({ onChanged }: { onChanged: () => Promise<void> }) {
+  const [status, setStatus] = useState<MailSyncStatus | null>(null);
+  const [since, setSince] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<SyncPreview | null>(null);
+  // The company to save each mail under; blank means skip that mail.
+  const [companies, setCompanies] = useState<Record<string, string>>({});
+  const [saved, setSaved] = useState<SaveResult | null>(null);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      setStatus(await api<MailSyncStatus>("/api/admin/mail"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't read the mail sync status.");
+    }
+  }, []);
+  useEffect(() => {
+    void loadStatus();
+  }, [loadStatus]);
+
+  const when = (iso: string) => new Date(iso).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
+
+  async function check() {
+    setBusy(true);
+    setError(null);
+    setSaved(null);
+    try {
+      const p = await api<SyncPreview>("/api/admin/mail/sync", { json: { since: since || undefined } });
+      setPreview(p);
+      setCompanies(Object.fromEntries(p.mails.map((m) => [m.id, m.company ?? ""])));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        await onChanged();
+        return;
+      }
+      setError(err instanceof Error ? err.message : "Couldn't check the mail.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const willSave = preview?.mails.filter((m) => (companies[m.id] ?? "").trim() !== "" && m.ids.length > 0) ?? [];
+
+  async function save() {
+    if (!preview) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api<SaveResult>("/api/admin/mail/save", {
+        json: {
+          mails: preview.mails.map((m) => ({
+            id: m.id,
+            subject: m.subject,
+            date: m.date,
+            company: (companies[m.id] ?? "").trim() || null,
+            ids: m.ids,
+          })),
+        },
+      });
+      setSaved(result);
+      setPreview(null);
+      setSince("");
+      await Promise.all([loadStatus(), onChanged()]);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        await onChanged();
+        return;
+      }
+      setError(err instanceof Error ? err.message : "Couldn't save.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="card" aria-labelledby="mail-title">
+      <h2 id="mail-title">Sync placements from Gmail</h2>
+      {status && !status.configured ? (
+        <div className="notice warn">
+          Not set up yet. Add <code>GOOGLE_CLIENT_ID</code>, <code>GOOGLE_CLIENT_SECRET</code> and{" "}
+          <code>GOOGLE_REFRESH_TOKEN</code> as settings, then redeploy. The README has the steps.
+        </div>
+      ) : (
+        <>
+          <p className="hint">
+            Reads mails matching <code>{status?.query ?? "…"}</code>, takes the company from the subject and the Neo IDs
+            from the body, and only looks at mail it hasn't handled before.{" "}
+            {status?.checkedUpTo ? <>Checked up to <b>{when(status.checkedUpTo)}</b>.</> : status ? <>Nothing has been synced yet.</> : null}
+          </p>
+          <div className="searchbar">
+            <label htmlFor="mail-since" className="sr-only">
+              Start from
+            </label>
+            <input
+              id="mail-since"
+              type="date"
+              value={since}
+              max={new Date().toISOString().slice(0, 10)}
+              onChange={(e) => setSince(e.target.value)}
+              style={{ maxWidth: 190 }}
+            />
+            <button className="btn primary" onClick={check} disabled={busy || !status || (!status.checkedUpTo && !since)}>
+              {busy && !preview ? "Checking…" : "Check mail"}
+            </button>
+          </div>
+          <p className="hint">
+            {status?.checkedUpTo
+              ? "Leave the date empty to continue from where the last sync stopped, or pick an earlier date to look further back."
+              : "Pick the date to start from. Nothing is saved until you confirm."}
+          </p>
+        </>
+      )}
+
+      {error && (
+        <div className="notice bad" role="alert">
+          {error}
+        </div>
+      )}
+
+      {saved && (
+        <div className="notice ok" role="status">
+          Saved {saved.saved.length} {saved.saved.length === 1 ? "mail" : "mails"}
+          {saved.skipped > 0 && <>, skipped {saved.skipped}</>}.
+          {saved.saved.length > 0 && (
+            <ul>
+              {saved.saved.map((r, i) => (
+                <li key={i}>
+                  {r.company}: {r.added} added{r.alreadyIn > 0 && <>, {r.alreadyIn} already there</>}
+                  {r.unknownStudents > 0 && <>, {r.unknownStudents} with no student record yet</>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {preview && (
+        <div role="status">
+          {preview.mails.length === 0 ? (
+            <p className="empty">
+              No new mail since {when(preview.since)}
+              {preview.alreadySynced > 0 && <> ({preview.alreadySynced} already handled)</>}.
+            </p>
+          ) : (
+            <>
+              <p className="hint">
+                {preview.mails.length} new {preview.mails.length === 1 ? "mail" : "mails"} since {when(preview.since)}.
+                Fix a company name if it's wrong, or clear it to skip that mail.
+                {preview.waiting > 0 && <> {preview.waiting} more are waiting. Save these, then check again.</>}
+              </p>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Received</th>
+                      <th scope="col">Subject</th>
+                      <th scope="col">Company</th>
+                      <th scope="col">Neo IDs</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.mails.map((m) => (
+                      <tr key={m.id}>
+                        <td>{when(m.date)}</td>
+                        <td>{m.subject || <span className="none">(no subject)</span>}</td>
+                        <td>
+                          <input
+                            type="text"
+                            aria-label={`Company for: ${m.subject}`}
+                            value={companies[m.id] ?? ""}
+                            maxLength={100}
+                            disabled={m.ids.length === 0}
+                            placeholder={m.company === null ? "Type the company" : ""}
+                            onChange={(e) => setCompanies((c) => ({ ...c, [m.id]: e.target.value }))}
+                          />
+                        </td>
+                        <td className="num">
+                          {m.ids.length > 0 ? m.ids.length : <span className="none">none found, will be skipped</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="row" style={{ marginTop: 12 }}>
+                <button className="btn primary" onClick={save} disabled={busy}>
+                  {busy ? "Saving…" : `Save ${willSave.length} ${willSave.length === 1 ? "mail" : "mails"}`}
+                </button>
+                <button className="btn quiet" onClick={() => setPreview(null)} disabled={busy}>
+                  Discard
+                </button>
               </div>
             </>
           )}
